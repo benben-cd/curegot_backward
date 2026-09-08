@@ -182,7 +182,8 @@ public:
         bool input_on_device = false
     ):
         m_n(n), m_m(m), m_Me(n * m), m_Te(n * (m - 1)), m_Hsize(n + m - 1), m_Kmax(Kmax), m_reg(reg),
-        d_M_storage(nullptr), m_sinkhorn_stop_flag(true), m_linsolver(std::make_unique<SparseCholeskySolver>())
+        d_M_storage(nullptr), m_sinkhorn_stop_flag(true),
+        m_linsolver(std::make_unique<SparseCholeskySolver>())
     {
         nvtx3::scoped_range r{"SPLRSolver"};
 
@@ -265,41 +266,37 @@ public:
     {
         nvtx3::scoped_range r{"~SPLRSolver"};
 
-        // cuDSS matrix wrappers reference CUDA buffers owned by SPLRSolver.
-        // Destroy the solver before freeing those backing buffers.
+        // Destroy cuDSS objects before freeing the CUDA buffers they reference.
+        // In the future transfer path this pointer may already be null.
         m_linsolver.reset();
 
-        // Free device memory
-        if (d_M_storage != nullptr)
-        {
-            CUDA_CHECK(cudaFree(d_M_storage));
-        }
-        CUDA_CHECK(cudaFree(d_ab));
-        CUDA_CHECK(cudaFree(d_logab));
-        CUDA_CHECK(cudaFree(d_gamma));
-        CUDA_CHECK(cudaFree(d_gamma_prev));
-        CUDA_CHECK(cudaFree(d_gamma_bcd));
-        CUDA_CHECK(cudaFree(d_grad_bcd));
-        CUDA_CHECK(cudaFree(d_grad_prev));
-        CUDA_CHECK(cudaFree(d_linsolve_rhs));
-        CUDA_CHECK(cudaFree(d_linsolve_sol));
-        // CUDA_CHECK(cudaFree(d_grad));
-        // CUDA_CHECK(cudaFree(d_direc));
-        // CUDA_CHECK(cudaFree(d_y));
-        // CUDA_CHECK(cudaFree(d_invA_y));
-        CUDA_CHECK(cudaFree(d_s));
-        CUDA_CHECK(cudaFree(d_Hvalues));
-        CUDA_CHECK(cudaFree(d_Hflatind));
-        CUDA_CHECK(cudaFree(d_Hcolind));
-        CUDA_CHECK(cudaFree(d_Hrowptr));
-        CUDA_CHECK(cudaFree(d_work));
-        CUDA_CHECK(cudaFree(d_iwork));
+        // Free device memory. Null guards keep the moved-from state safe after
+        // backward-state ownership has been transferred to a context.
+        if (d_M_storage != nullptr) CUDA_CHECK(cudaFree(d_M_storage));
+        if (d_ab != nullptr) CUDA_CHECK(cudaFree(d_ab));
+        if (d_logab != nullptr) CUDA_CHECK(cudaFree(d_logab));
+        if (d_gamma != nullptr) CUDA_CHECK(cudaFree(d_gamma));
+        if (d_gamma_prev != nullptr) CUDA_CHECK(cudaFree(d_gamma_prev));
+        if (d_gamma_bcd != nullptr) CUDA_CHECK(cudaFree(d_gamma_bcd));
+        if (d_grad_bcd != nullptr) CUDA_CHECK(cudaFree(d_grad_bcd));
+        if (d_grad_prev != nullptr) CUDA_CHECK(cudaFree(d_grad_prev));
+        if (d_linsolve_rhs != nullptr) CUDA_CHECK(cudaFree(d_linsolve_rhs));
+        if (d_linsolve_sol != nullptr) CUDA_CHECK(cudaFree(d_linsolve_sol));
+        // d_grad, d_direc, d_y and d_invA_y are aliases into the two blocks
+        // above and must not be freed separately.
+        if (d_s != nullptr) CUDA_CHECK(cudaFree(d_s));
+        if (d_Hvalues != nullptr) CUDA_CHECK(cudaFree(d_Hvalues));
+        if (d_Hflatind != nullptr) CUDA_CHECK(cudaFree(d_Hflatind));
+        if (d_Hcolind != nullptr) CUDA_CHECK(cudaFree(d_Hcolind));
+        if (d_Hrowptr != nullptr) CUDA_CHECK(cudaFree(d_Hrowptr));
+        if (d_work != nullptr) CUDA_CHECK(cudaFree(d_work));
+        if (d_iwork != nullptr) CUDA_CHECK(cudaFree(d_iwork));
 
         // Free pinned memory
-        CUDA_CHECK(cudaFreeHost(h_pinned));
+        if (h_pinned != nullptr) CUDA_CHECK(cudaFreeHost(h_pinned));
 
         // Destroy CUDA stream for Sinkhorn iterations
-        CUDA_CHECK(cudaStreamDestroy(m_sinkhorn_stream));
+        if (m_sinkhorn_stream != nullptr) CUDA_CHECK(cudaStreamDestroy(m_sinkhorn_stream));
     }
 
     // Sinkhorn iteration to update alpha
@@ -960,6 +957,64 @@ public:
         );
     }
 
+    // Transfer the forward-owned cuDSS state and all backing buffers needed
+    // by the backward preconditioner to the context. This helper is intended
+    // for the Stage-3B.2-C zero-extra-factorization path and is not called by
+    // the current main loop.
+    //
+    // The transferred cuDSS wrappers depend on the following base allocations:
+    //   d_Hvalues / d_Hcolind / d_Hrowptr
+    //   d_linsolve_rhs / d_linsolve_sol
+    // The low-rank apply path additionally needs d_s. d_y and d_invA_y are
+    // aliases into the second columns of rhs/sol and are reconstructed by the
+    // context after adoption.
+    void transfer_backward_state_to(
+        SPLRBackwardContext& ctx,
+        size_t nnz,
+        double ys,
+        bool low_rank,
+        bool with_validation
+    )
+    {
+        if (!m_linsolver)
+        {
+            fprintf(stderr, "SPLRSolver: no linear solver state to transfer\n");
+            exit(EXIT_FAILURE);
+        }
+
+        // Ensure that no cuDSS operation or forward CUDA kernel is still using
+        // the backing buffers before ownership changes hands.
+        CUDA_CHECK(cudaStreamSynchronize(m_linsolver->get_cuda_stream()));
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        ctx.adopt_forward_state(
+            std::move(m_linsolver),
+            d_Hvalues, d_Hcolind, d_Hrowptr,
+            (int)m_Hsize, nnz,
+            d_linsolve_rhs, d_linsolve_sol,
+            d_s,
+            ys, low_rank, m_reg, false,
+            with_validation ? d_gamma_prev : nullptr
+        );
+
+        // Leave the source in a valid moved-from state. The context is now the
+        // sole owner of these base allocations.
+        m_linsolver = nullptr;
+        d_Hvalues = nullptr;
+        d_Hcolind = nullptr;
+        d_Hrowptr = nullptr;
+        d_linsolve_rhs = nullptr;
+        d_linsolve_sol = nullptr;
+        d_s = nullptr;
+
+        // These are aliases into rhs/sol and must not survive as dangling
+        // pointers in the source object.
+        d_grad = nullptr;
+        d_y = nullptr;
+        d_direc = nullptr;
+        d_invA_y = nullptr;
+    }
+
     // Get the current point d_gamma (used by the fallback path, where the
     // factorization is made at the final point)
     const double* current_point() const { return d_gamma; }
@@ -1233,9 +1288,10 @@ void cuda_sinkhorn_splr(
 //    Hessian at the final point is factorized inside the context as a
 //    fallback, without the low-rank correction.
 //
-// Stage-3B.1 note: this is a conservative correctness baseline. It does not
-// move or rebind the forward solver's cuDSS factorization. True
-// zero-extra-factorization ownership transfer is left for a later stage.
+// Stage-3B.2 note: transfer_backward_state_to() provides the ownership
+// handoff API, but this function still uses the conservative
+// snapshot + context-refactorization path. The handoff is intentionally not
+// called until the later zero-extra-factorization stage.
 void cuda_sinkhorn_splr_bwd(
     const double* M, const double* a, const double* b, double* P,
     double reg, int max_iter, double tol, int n, int m, int* niter,

@@ -27,20 +27,25 @@
 // with q = A^{-1} r and u = A^{-1} y. This is the forward search-direction
 // update rule, minus the final -reg scaling.
 //
-// Important ownership note:
+// Ownership modes:
 //
-//   This version does NOT move or rebind the forward solver's cuDSS
-//   factorization. The forward only provides a CSR snapshot and low-rank
-//   materials; the context performs a fresh analyze + factorization on its
-//   own snapshot. This avoids relying on replacing cudssMatrix_t after a
-//   numerical factorization. True zero-extra-factorization ownership
-//   transfer is left for a later stage.
+//   1. Snapshot mode (current Stage-3B.1 baseline): the forward provides a
+//      CSR snapshot and low-rank materials; the context performs a fresh
+//      analyze + factorization on its private buffers.
+//   2. Adopted-forward-state mode (Stage-3B.2 API): the context takes
+//      ownership of the forward SparseCholeskySolver and the exact backing
+//      buffers referenced by its cuDSS wrappers. This mode is not used by
+//      the main forward path yet.
 //
 // Lifetime invariant:
 //
 //   1. m_solver is destroyed first, which destroys all cudssMatrix_t
 //      wrappers, cudssData_t, cudssConfig_t and cudssHandle_t;
 //   2. only after that are the CSR/rhs/solution/low-rank GPU buffers freed.
+//
+// In adopted mode, d_y and d_invA_y are non-owning aliases into the second
+// columns of d_rhs and d_sol, respectively. Ownership flags below make this
+// distinction explicit and prevent double-free in the destructor.
 class SPLRBackwardContext
 {
 public:
@@ -86,6 +91,30 @@ public:
     // final point and is factorized here without low-rank terms.
     void factorize_fallback(double reg, const double* d_ctx_pt);
 
+    // Adopt a forward-owned solver and its exact backing buffers. This is a
+    // Stage-3B.2 ownership API intended for the later zero-extra-factorization
+    // path; it is not called by the current main forward loop.
+    //
+    // Ownership transferred to this context:
+    //   - solver (including its cuDSS factorization state);
+    //   - d_values / d_colind / d_rowptr;
+    //   - d_rhs_fwd / d_sol_fwd (each allocation has two columns);
+    //   - d_s_fwd.
+    //
+    // In low-rank mode, d_y and d_invA_y are aliases:
+    //   d_y      = d_rhs_fwd + problem_size
+    //   d_invA_y = d_sol_fwd + problem_size
+    // and are therefore not freed separately.
+    void adopt_forward_state(
+        std::unique_ptr<SparseCholeskySolver> solver,
+        double* d_values, int* d_colind, int* d_rowptr,
+        int dim, size_t nnz,
+        double* d_rhs_fwd, double* d_sol_fwd,
+        double* d_s_fwd,
+        double ys, bool low_rank, double reg, bool fallback,
+        const double* d_ctx_pt
+    );
+
     // ---------------- Backward-side interface ----------------
 
     // Compute z = B^{-1} r. d_r and d_z are device pointers of length
@@ -111,6 +140,10 @@ public:
     bool          has_ctx_point() const { return d_ctx_point != nullptr; }
 
 private:
+    // Free GPU buffers that can be replaced by adopted forward state. This
+    // preserves d_ctx_point and h_pinned, which remain context-owned.
+    void release_replaceable_buffers();
+
     // Free GPU/pinned buffers only. This function must not touch cuDSS
     // handles; the solver is reset separately before these buffers are freed.
     void release_buffers();
@@ -124,15 +157,25 @@ private:
     double m_reg = 0.0;        // regularization parameter (eta)
     double m_ys = 0.0;         // y^T s of the last secant pair
     bool   m_low_rank = false; // whether the rank-2 correction is active
-    bool   m_fallback = false; // true if factorize_fallback() was used
-    bool   m_valid = false;    // true after the owned snapshot is factorized
+    bool   m_fallback = false; // true if the fallback path was used
+    bool   m_valid = false;    // true after the context has usable state
+    bool   m_adopted_forward_state = false; // true after adopt_forward_state()
 
-    // The context owns its own solver and factorization of the snapshot.
-    // A unique_ptr is used so that destruction order is explicit:
-    // solver first, backing buffers second.
+    // Allocation ownership flags. In snapshot mode all replaceable buffers
+    // are context-owned. In adopted mode, CSR/rhs/sol/s are transferred and
+    // owned, while y and invA_y are aliases into rhs/sol.
+    bool m_owns_csr = false;
+    bool m_owns_rhs = false;
+    bool m_owns_sol = false;
+    bool m_owns_s = false;
+    bool m_owns_y = false;
+    bool m_owns_invA_y = false;
+
+    // Solver and active factorization state. A unique_ptr is used so that
+    // destruction order is explicit: solver first, backing buffers second.
     std::unique_ptr<SparseCholeskySolver> m_solver;
 
-    // CSR backing buffers (private copies of the selected matrix)
+    // CSR backing buffers (context-owned snapshot or adopted forward buffers)
     double* d_Avalues = nullptr;
     int*    d_Acolind = nullptr;
     int*    d_Arowptr = nullptr;
@@ -141,7 +184,8 @@ private:
     double* d_rhs = nullptr;
     double* d_sol = nullptr;
 
-    // Low-rank materials
+    // Low-rank materials. In adopted mode, d_y aliases d_rhs + m_Hsize and
+    // d_invA_y aliases d_sol + m_Hsize; the ownership flags reflect this.
     double* d_s = nullptr;
     double* d_y = nullptr;
     double* d_invA_y = nullptr;
