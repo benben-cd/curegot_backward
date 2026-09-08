@@ -2,6 +2,7 @@
 #include <cmath>
 #include <thread>
 #include <atomic>
+#include <utility>
 
 // CUDA headers
 #include <cuda_runtime.h>
@@ -17,6 +18,9 @@
 
 // Linear solver
 #include "linsolve.h"
+
+// Backward-propagation context
+#include "backward_context.h"
 
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
@@ -926,6 +930,35 @@ public:
         CUDA_CHECK(cudaMemcpy(d_gamma, d_gamma_bcd, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice));
     }
 
+    // --- Backward-context export (used by cuda_sinkhorn_splr_bwd) ---
+
+    // Snapshot the current sparsified Hessian CSR triple into the backward
+    // context. Must be called right after compute_search_direc(), so that
+    // the snapshot holds exactly the matrix consumed by the factorization.
+    void snapshot_sphess(SPLRBackwardContext& ctx, size_t nnz) const
+    {
+        ctx.snapshot_sphess(d_Hvalues, d_Hcolind, d_Hrowptr, nnz);
+    }
+
+    // Initialize the backward context from its private CSR snapshot and copy
+    // the low-rank materials (s, y, invA_y). The context performs its own
+    // analyze + factorization. The forward solver retains ownership of its
+    // cuDSS factorization and destroys it normally.
+    void export_backward_context(
+        SPLRBackwardContext& ctx, bool low_rank, double ys,
+        bool with_validation
+    )
+    {
+        ctx.initialize_from_snapshot(
+            d_s, d_y, d_invA_y, ys, low_rank, m_reg,
+            with_validation ? d_gamma_prev : nullptr
+        );
+    }
+
+    // Get the current point d_gamma (used by the fallback path, where the
+    // factorization is made at the final point)
+    const double* current_point() const { return d_gamma; }
+
     // Output results to host -- transport plan and dual variables
     void output_result(double* P, double* dual, bool output_on_device = false)
     {
@@ -1177,6 +1210,278 @@ void cuda_sinkhorn_splr(
     // Final Sinkhorn iteration
     // solver.update_beta();
     // solver.update_alpha();
+
+    // Compute final transport plan and output results to host
+    solver.output_result(P, dual, output_on_device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+
+// Backward-capable variant of cuda_sinkhorn_splr.
+//
+// The forward iteration is identical to cuda_sinkhorn_splr(), except that
+// 1. the CSR triple consumed by each factorization is snapshotted into the
+//    backward context right after compute_search_direc();
+// 2. when the loop exits, the context copies the low-rank secant materials
+//    and performs its own analyze + factorization on the last snapshot;
+// 3. if the loop is never entered (immediate convergence), the sparsified
+//    Hessian at the final point is factorized inside the context as a
+//    fallback, without the low-rank correction.
+//
+// Stage-3B.1 note: this is a conservative correctness baseline. It does not
+// move or rebind the forward solver's cuDSS factorization. True
+// zero-extra-factorization ownership transfer is left for a later stage.
+void cuda_sinkhorn_splr_bwd(
+    const double* M, const double* a, const double* b, double* P,
+    double reg, int max_iter, double tol, int n, int m, int* niter,
+    double density_max, double shift_max,
+    int sparsity_pattern_cycle, int candidate_sinkhorn_iter, int verbose,
+    const double* x0, double* dual,
+    bool input_on_device, bool output_on_device,
+    SPLRBackwardContext* ctx, bool* converged, bool with_validation
+)
+{
+    // Algorithmic parameters
+    // density
+    density_max = std::min(density_max, 1.0);
+    density_max = std::max(density_max, 0.0);
+    const double density_min = 0.01 * density_max;
+    double density = 0.1 * density_max;
+    // shift
+    double shift = shift_max;
+    // Kmax -- maximum number of nonzero elements in sparsified T_t
+    size_t Kmax = static_cast<size_t>(density_max * n * (m - 1));
+    Kmax = std::max(Kmax, size_t(1));
+
+    // Create solver object
+    SPLRSolver solver(M, a, b, reg, n, m, Kmax, input_on_device);
+
+    // Initialize dual variables
+    solver.init_dual(x0, input_on_device);
+
+    // Initial objective function value (f), gradient (g),
+    // and sparsified Hessian (sphess)
+    double objfn, gnorm;
+    // Only compute f and g
+    constexpr bool compute_gnorm = true;
+    solver.dual_T_objfn_grad(objfn, gnorm, compute_gnorm, false);
+    // ||grad|| will be used for updating shift
+    double gnorm_init = gnorm;
+    shift = std::min(gnorm, shift_max);
+    // Then continue computing sphess by
+    // Note: shift should be applied to Hessian, but what we compute is Hsl = H * reg
+    // Therefore, here we multiply shift by reg before adding to Hsl
+    size_t nnz = solver.dual_sphess(density, shift * reg, false);
+
+    // Main iteration
+    // Initial step size
+    double alpha = 1.0;
+    // Low-rank materials of the last completed iteration, hoisted out of
+    // the loop so that they can be exported to the backward context
+    double ys = 0.0, yy = 0.0;
+    bool low_rank = false;
+    // Convergence flag
+    bool converged_flag = false;
+    // Timer
+    Timer timer_inner(verbose >= 2);
+    for (int iter = 0; iter < max_iter; iter++)
+    {
+        if (verbose >= 1)
+        {
+            std::cout << "iter = " << iter << ", objval = " << objfn <<
+                ", ||grad|| = " << gnorm << std::endl;
+        }
+
+        // Start timing
+        timer_inner.tic();
+
+        // Convergence test
+        if (gnorm < tol)
+        {
+            converged_flag = true;
+            break;
+        }
+        // Also exit if objective function value is not finite
+        if (!std::isfinite(objfn))
+            break;
+
+        // Compute y = grad - grad_prev and s = gamma - gamma_prev
+        // ys = y's, yy = y'y
+        solver.compute_low_rank(ys, yy);
+        timer_inner.toc("low_rank");
+
+        // Compute search direction
+        // Sparse Cholesky decomposition and solving + BFGS update rule
+        //
+        // We do not do low-rank update in the first iteration
+        // When <y, s> is too small, don't use low-rank update
+        constexpr double eps = 1e-6;  // Or use std::numeric_limits<double>::epsilon();
+        low_rank = (iter > 0) && (ys > (eps * yy));
+        // Sparse Cholesky decomposition has three main stages:
+        // sparsity pattern analysis, factorization, and solving
+        //
+        // Pattern analysis runs on CPU, and may be time-consuming,
+        // so we can fix the pattern for a few iterations and cyclically update it
+        //
+        // Below are flags to indicate whether we need to analyze or update the sparsity pattern
+        // in the current iteration (basically we update the pattern every `sparsity_pattern_cycle` iterations
+        // and do the sparsity analysis in the next iteration)
+        const bool analyze_pattern = (iter % sparsity_pattern_cycle == 0);
+        const bool update_pattern = (iter % sparsity_pattern_cycle == (sparsity_pattern_cycle - 1));
+
+        // When we need to analyze the sparsity pattern in this iteration,
+        // we also compute the Sinkhorn iterate, since the majority of the pattern analysis
+        // runs on CPU, and we can let GPU work to fill this idle time. In this way,
+        // we do not increase the wall time, but can obtain some useful information about the
+        // next move
+        //
+        // The Sinkhorn iterate is a candidate for the next move. For example, we can
+        // compare the objective function value and gradient of both the Sinkhorn iterate
+        // and the quasi-Newton iterate, and then decide which one is the next move
+        if (analyze_pattern && (candidate_sinkhorn_iter != 0))
+        {
+            // This part will run roughly at the same time as the analysis stage of
+            // the sparse Cholesky decomposition
+            solver.compute_sinkhorn_iterate(candidate_sinkhorn_iter);
+        }
+        solver.compute_search_direc(nnz, ys, low_rank, analyze_pattern, verbose);
+        timer_inner.toc("search_direc");
+
+        // Snapshot the CSR triple that has just been factorized, so that the
+        // backward context holds exactly the matrix consumed by cuDSS
+        if (ctx != nullptr)
+        {
+            solver.snapshot_sphess(*ctx, nnz);
+        }
+
+        // Line search will overwrite d_gamma and d_grad, so
+        // save d_gamma to d_gamma_prev, and d_grad to d_grad_prev
+        solver.save_history();
+
+        // Let Sinkhorn and quasi-Newton computation synchronize here
+        // CUDA_CHECK(cudaDeviceSynchronize());
+        // In fact, the cudaMemcpy() function in solver.save_history() will implicitly synchronize,
+        // so we do not need to explicitly call cudaDeviceSynchronize() here
+
+        // Wolfe Line Search
+        // Will overwrite d_gamma and d_grad
+        // If the updated recompute_fg is false, then the overwritten d_gamma
+        // is the new point, and objfn and d_grad contain the corresponding
+        // objective function value and gradient, respectively
+        // Otherwise, we need to recompute d_gamma, objfn, and d_grad
+        bool recompute_fg = true;
+        alpha = solver.line_search_wolfe(
+            std::min(1.0, 1.5 * alpha), objfn, objfn, recompute_fg, !update_pattern
+        );
+        timer_inner.toc("line_search");
+
+        // Recompute the new point if needed, and compute the new gradient norm
+        const double gnorm_pre = gnorm;
+        if (recompute_fg)
+        {
+            // d_gamma = d_gamma_prev + alpha * direc
+            solver.update_gamma(alpha);
+            // Compute f and g on new point d_gamma
+            // Also compute gradient norm
+            solver.dual_T_objfn_grad(objfn, gnorm, true, !update_pattern);        }
+        else
+        {
+            // f and g have been computed in line search,
+            // so we only compute gradient norm here
+            gnorm = solver.grad_norm();
+        }
+        timer_inner.toc("grad");
+
+        // If analyze_pattern is true, it means that we have also computed the Sinkhorn iterate
+        // If it is better than the quasi-Newton direction (both objfn and gnorm are smaller),
+        // then we overwrite gamma with the Sinkhorn iterate
+        if (analyze_pattern && (candidate_sinkhorn_iter != 0))
+        {
+            double objfn_bcd, gnorm_bcd;
+            solver.objfn_gnorm_bcd(objfn_bcd, gnorm_bcd);
+            // const bool use_sinkhorn_iter = ((objfn_bcd < objfn) && (gnorm_bcd < gnorm));
+            const bool use_sinkhorn_iter = ((objfn_bcd < objfn) && (gnorm_bcd < 10 * gnorm));
+
+            if (verbose >= 2)
+            {
+                std::cout << "[sinkhorn] ------------------------------------------------" << std::endl;
+                std::cout << "║ objfn = " << objfn << ", objfn_bcd = " << objfn_bcd << std::endl;
+                std::cout << "║ gnorm = " << gnorm << ", gnorm_bcd = " << gnorm_bcd << std::endl;
+                std::cout << "║ use_sinkhorn_iter = " << use_sinkhorn_iter << std::endl;
+                std::cout << "===========================================================" << std::endl;
+            }
+
+            if (use_sinkhorn_iter)
+            {
+                // Overwrite d_gamma with the Sinkhorn iterate
+                solver.update_gamma_sinkhorn();
+                // Recompute objfn and gnorm
+                solver.dual_T_objfn_grad(objfn, gnorm, true, !update_pattern);
+            }
+        }
+
+        // Adjust density according to gnorm change
+        if (update_pattern)
+        {
+            const bool bad_move = (gnorm_pre < gnorm_init) && (gnorm > gnorm_pre);
+            density *= (bad_move ? 1.1 : 0.99);
+            density = std::min(density_max, std::max(density_min, density));
+        }
+
+        // Compute sphess
+        shift = std::min(gnorm, shift_max);
+        nnz = solver.dual_sphess(density, shift * reg, !update_pattern);
+        timer_inner.toc("sphess");
+
+        if (verbose >= 2)
+        {
+            std::cout << "[lowrank]--------------------------------------------------" << std::endl;
+            std::cout << "║ ys = " << ys << ", yy = " << yy << std::endl;
+            std::cout << "║ low_rank = " << low_rank << ", analyze = " << analyze_pattern <<
+                ", update = " << update_pattern << std::endl;
+            std::cout << "===========================================================" << std::endl;
+            std::cout << "[timing]---------------------------------------------------" << std::endl;
+            std::cout << "║ low_rank = " << timer_inner["low_rank"] <<
+                ", search_direc = " << timer_inner["search_direc"] << std::endl;
+            std::cout << "║ line_search = " << timer_inner["line_search"] << std::endl;
+            std::cout << "║ grad = " << timer_inner["grad"] <<
+                ", sphess = " << timer_inner["sphess"] << std::endl;
+            std::cout << "===========================================================" << std::endl << std::endl;
+        }
+
+        *niter = iter + 1;
+    }
+
+    // Export the backward context
+    if (ctx != nullptr)
+    {
+        if (!std::isfinite(objfn))
+        {
+            // Non-finite objective value: the forward state is invalid,
+            // so the context is left invalid
+        }
+        else if (*niter > 0)
+        {
+            // Initialize from the last CSR snapshot (made at d_gamma_prev),
+            // together with the low-rank materials of the last completed
+            // iteration. The context refactorizes the snapshot internally.
+            solver.export_backward_context(*ctx, low_rank, ys, with_validation);
+        }
+        else
+        {
+            // Immediate convergence: no factorization was ever made.
+            // Factorize the sparsified Hessian at the final point inside
+            // the context, without the low-rank correction
+            solver.snapshot_sphess(*ctx, nnz);
+            ctx->factorize_fallback(
+                reg, with_validation ? solver.current_point() : nullptr
+            );
+        }
+    }
+    if (converged != nullptr)
+    {
+        *converged = converged_flag;
+    }
 
     // Compute final transport plan and output results to host
     solver.output_result(P, dual, output_on_device);
