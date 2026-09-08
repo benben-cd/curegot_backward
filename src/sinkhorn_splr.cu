@@ -1288,10 +1288,11 @@ void cuda_sinkhorn_splr(
 //    Hessian at the final point is factorized inside the context as a
 //    fallback, without the low-rank correction.
 //
-// Stage-3B.2 note: transfer_backward_state_to() provides the ownership
-// handoff API, but this function still uses the conservative
-// snapshot + context-refactorization path. The handoff is intentionally not
-// called until the later zero-extra-factorization stage.
+// Stage-3B.2-C1 note: delay the final dual_sphess() rebuild. Once the
+// updated point is known to be the last one, keep the forward CSR buffers and
+// cuDSS factorization associated with A_k instead of overwriting them with
+// A_{k+1}. Ownership handoff is still intentionally disabled; the backward
+// context continues to use snapshot + context-refactorization.
 void cuda_sinkhorn_splr_bwd(
     const double* M, const double* a, const double* b, double* P,
     double reg, int max_iter, double tol, int n, int m, int* niter,
@@ -1343,6 +1344,10 @@ void cuda_sinkhorn_splr_bwd(
     bool low_rank = false;
     // Convergence flag
     bool converged_flag = false;
+    // Set when a completed update produces a non-finite objective or gradient.
+    // This keeps the delayed-Hessian stop condition and context export check
+    // consistent without changing the normal numerical path.
+    bool invalid_state = false;
     // Timer
     Timer timer_inner(verbose >= 2);
     for (int iter = 0; iter < max_iter; iter++)
@@ -1489,9 +1494,26 @@ void cuda_sinkhorn_splr_bwd(
             density = std::min(density_max, std::max(density_min, density));
         }
 
-        // Compute sphess
-        shift = std::min(gnorm, shift_max);
-        nnz = solver.dual_sphess(density, shift * reg, !update_pattern);
+        // Stage-3B.2-C1: decide whether this completed step is the final one
+        // before rebuilding the Hessian at gamma_{k+1}. If the loop will stop,
+        // keep the forward CSR buffers and cuDSS factorization associated with
+        // A_k for the later ownership-transfer stage.
+        const bool converged_after_step =
+            std::isfinite(gnorm) && (gnorm < tol);
+        const bool max_iter_reached =
+            (iter + 1 >= max_iter);
+        const bool invalid_after_step =
+            !std::isfinite(objfn) || !std::isfinite(gnorm);
+        const bool stop_after_step =
+            converged_after_step || max_iter_reached || invalid_after_step;
+
+        // Compute sphess only when another iteration will actually use it.
+        // Otherwise, deliberately leave the working CSR buffers at A_k.
+        if (!stop_after_step)
+        {
+            shift = std::min(gnorm, shift_max);
+            nnz = solver.dual_sphess(density, shift * reg, !update_pattern);
+        }
         timer_inner.toc("sphess");
 
         if (verbose >= 2)
@@ -1511,15 +1533,34 @@ void cuda_sinkhorn_splr_bwd(
         }
 
         *niter = iter + 1;
+
+        if (stop_after_step)
+        {
+            if (invalid_after_step)
+            {
+                invalid_state = true;
+            }
+
+            // Preserve the old next-iteration-entry convergence semantics:
+            // convergence was previously detected only if another loop entry
+            // existed. In particular, reaching max_iter on the same step keeps
+            // the historical converged_flag behavior.
+            if (!max_iter_reached && converged_after_step)
+            {
+                converged_flag = true;
+            }
+            break;
+        }
     }
 
     // Export the backward context
     if (ctx != nullptr)
     {
-        if (!std::isfinite(objfn))
+        if (invalid_state || !std::isfinite(objfn))
         {
-            // Non-finite objective value: the forward state is invalid,
-            // so the context is left invalid
+            // Non-finite forward state: the context is left invalid. The
+            // invalid_state flag also covers the delayed-Hessian exit caused
+            // by a non-finite gradient with a finite objective value.
         }
         else if (*niter > 0)
         {
