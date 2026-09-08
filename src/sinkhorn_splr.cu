@@ -3,6 +3,7 @@
 #include <thread>
 #include <atomic>
 #include <utility>
+#include <memory>
 
 // CUDA headers
 #include <cuda_runtime.h>
@@ -171,7 +172,7 @@ private:
     int*          d_iwork;
     double*       h_pinned;
     // Sparse Cholesky solver
-    SparseCholeskySolver m_linsolver;
+    std::unique_ptr<SparseCholeskySolver> m_linsolver;
 
 public:
     // Constructor
@@ -181,7 +182,7 @@ public:
         bool input_on_device = false
     ):
         m_n(n), m_m(m), m_Me(n * m), m_Te(n * (m - 1)), m_Hsize(n + m - 1), m_Kmax(Kmax), m_reg(reg),
-        d_M_storage(nullptr), m_sinkhorn_stop_flag(true)
+        d_M_storage(nullptr), m_sinkhorn_stop_flag(true), m_linsolver(std::make_unique<SparseCholeskySolver>())
     {
         nvtx3::scoped_range r{"SPLRSolver"};
 
@@ -263,6 +264,10 @@ public:
     ~SPLRSolver()
     {
         nvtx3::scoped_range r{"~SPLRSolver"};
+
+        // cuDSS matrix wrappers reference CUDA buffers owned by SPLRSolver.
+        // Destroy the solver before freeing those backing buffers.
+        m_linsolver.reset();
 
         // Free device memory
         if (d_M_storage != nullptr)
@@ -564,16 +569,16 @@ public:
         // direc = invA_g = inv(A) * g;
         Timer timer(verbose >= 3);
         timer.tic();
-        cudaStream_t stream = m_linsolver.get_cuda_stream();
+        cudaStream_t stream = m_linsolver->get_cuda_stream();
         // If low_rank = true, then we need to solve two vectors,
         //     A * [direc, invA_y] = [grad, y]
         // Otherwise we only solve A * direc = grad
         // Since the memory layout is d_linsolve_rhs = [d_grad, d_y] and
         // d_linsolve_sol = [d_direc, d_invA_y], we just need to specify
         // how many rhs to solve
-        m_linsolver.set_A(d_Hvalues, d_Hcolind, d_Hrowptr, m_Hsize, nnz);
-        m_linsolver.set_b(d_linsolve_rhs, m_Hsize, low_rank ? 2 : 1);
-        m_linsolver.set_x(d_linsolve_sol, m_Hsize, low_rank ? 2 : 1);
+        m_linsolver->set_A(d_Hvalues, d_Hcolind, d_Hrowptr, m_Hsize, nnz);
+        m_linsolver->set_b(d_linsolve_rhs, m_Hsize, low_rank ? 2 : 1);
+        m_linsolver->set_x(d_linsolve_sol, m_Hsize, low_rank ? 2 : 1);
 
         if (analyze_pattern)
         {
@@ -582,7 +587,7 @@ public:
                 nvtx3::scoped_range reorder{"reorder"};
 
                 // Reordering stage mainly runs on CPU
-                m_linsolver.reorder();
+                m_linsolver->reorder();
                 timer.toc("reorder");
             }
 
@@ -604,13 +609,13 @@ public:
             // Scope for NVTX3 annotation
             {
                 nvtx3::scoped_range sym_fac{"sym_fac"};
-                m_linsolver.symfac();
+                m_linsolver->symfac();
                 timer.toc("symfac");
             }
         }
-        m_linsolver.factorize();
+        m_linsolver->factorize();
         timer.toc("factorize");
-        m_linsolver.solve();
+        m_linsolver->solve();
         timer.toc("solve");
 
         // After calling solve(), d_direc will contain the desired value
