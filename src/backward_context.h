@@ -10,9 +10,9 @@
 //
 // The backward pass of entropic-regularized OT requires solving linear
 // systems with the reduced Hessian H = (1/reg) * Q(T*) by implicit
-// differentiation. As a Stage-3B.1 correctness baseline, this context stores
-// a private CSR snapshot of the selected approximate Hessian A and creates
-// its OWN cuDSS factorization of that snapshot:
+// differentiation. Depending on the ownership mode, the context either reuses
+// the forward cuDSS factorization of the selected approximate Hessian A or
+// factorizes a private CSR snapshot:
 //
 //     B = A + (reg/ys) * y * y^T - (A s)(A s)^T / (s^T A s)   [low_rank enabled]
 //     B = A                                                    [low_rank disabled]
@@ -29,13 +29,13 @@
 //
 // Ownership modes:
 //
-//   1. Snapshot mode (current Stage-3B.1 baseline): the forward provides a
-//      CSR snapshot and low-rank materials; the context performs a fresh
+//   1. Snapshot mode (fallback/debug baseline): the forward provides a CSR
+//      snapshot and low-rank materials; the context performs a fresh
 //      analyze + factorization on its private buffers.
-//   2. Adopted-forward-state mode (Stage-3B.2 API): the context takes
-//      ownership of the forward SparseCholeskySolver and the exact backing
-//      buffers referenced by its cuDSS wrappers. This mode is not used by
-//      the main forward path yet.
+//   2. Adopted-forward-state mode (Stage-3B.2-C2 normal path): the context
+//      takes ownership of the forward SparseCholeskySolver and the exact
+//      backing buffers referenced by its cuDSS wrappers, then reuses the
+//      existing forward factorization with zero extra factorization.
 //
 // Lifetime invariant:
 //
@@ -66,11 +66,10 @@ public:
     // ---------------- Forward-side interface ----------------
     // The functions below are called by cuda_sinkhorn_splr_bwd() only.
 
-    // Snapshot a CSR triple produced by the forward pass. In the normal path
-    // this is called immediately after each compute_search_direc(), so the
-    // snapshot corresponds to the matrix consumed by that iteration's
-    // forward factorization, even though the forward working buffers are
-    // overwritten later by dual_sphess().
+    // Snapshot a CSR triple produced by the forward pass. This snapshot mode
+    // is retained for immediate-convergence fallback and debug/ablation
+    // baselines. The normal Stage-3B.2-C2 path adopts the forward state
+    // instead of snapshotting it.
     void snapshot_sphess(
         const double* d_values, const int* d_colind, const int* d_rowptr,
         size_t nnz
@@ -91,9 +90,9 @@ public:
     // final point and is factorized here without low-rank terms.
     void factorize_fallback(double reg, const double* d_ctx_pt);
 
-    // Adopt a forward-owned solver and its exact backing buffers. This is a
-    // Stage-3B.2 ownership API intended for the later zero-extra-factorization
-    // path; it is not called by the current main forward loop.
+    // Adopt a forward-owned solver and its exact backing buffers. This is the
+    // Stage-3B.2-C2 normal-path ownership API; it reuses the existing forward
+    // cuDSS factorization and performs no new analyze/factorization.
     //
     // Ownership transferred to this context:
     //   - solver (including its cuDSS factorization state);
@@ -125,6 +124,9 @@ public:
     bool   is_valid()       const { return m_valid; }
     bool   is_fallback()    const { return m_fallback; }
     bool   low_rank()       const { return m_low_rank; }
+    // true when the context adopted the forward solver's existing cuDSS
+    // factorization; false for snapshot/refactorization fallback paths.
+    bool   adopted_forward_state() const { return m_adopted_forward_state; }
     int    problem_size()   const { return m_Hsize; }
     double reg()            const { return m_reg; }
     double ys()             const { return m_ys; }

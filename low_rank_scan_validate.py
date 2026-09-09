@@ -119,6 +119,7 @@ def scan_low_rank_case(
             f"niter={niter:3d} | "
             f"converged={str(converged):5s} | "
             f"fallback={str(ctx.is_fallback):5s} | "
+            f"adopted={str(ctx.adopted_forward_state):5s} | "
             f"low_rank={str(ctx.low_rank_enabled):5s} | "
             f"ys={ctx.ys:.6e} | "
             f"yinvAy={yinvAy:.6e}"
@@ -127,6 +128,7 @@ def scan_low_rank_case(
         valid_low_rank = (
             ctx.low_rank_enabled
             and not ctx.is_fallback
+            and ctx.adopted_forward_state
             and ctx.ys > 0.0
             and math.isfinite(yinvAy)
             and yinvAy > 0.0
@@ -276,6 +278,11 @@ def lifetime_stress_test(
                 f"iteration {i}: unexpected fallback"
             )
 
+        if not ctx.adopted_forward_state:
+            raise RuntimeError(
+                f"iteration {i}: forward factorization was not adopted"
+            )
+
         if not ctx.low_rank_enabled:
             raise RuntimeError(
                 f"iteration {i}: "
@@ -368,8 +375,12 @@ def main():
     print("niter =", case["niter"])
     print("converged =", case["converged"])
     print("is_fallback =", ctx.is_fallback)
+    print("adopted_forward_state =", ctx.adopted_forward_state)
     print("low_rank_enabled =", ctx.low_rank_enabled)
     print("ys =", ctx.ys)
+
+    if not ctx.adopted_forward_state:
+        raise RuntimeError("selected low-rank context did not adopt the forward factorization")
 
     yinvAy = compute_yinvAy_dense(ctx, device)
     print("dense y^T A^{-1} y =", yinvAy)

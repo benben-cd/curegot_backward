@@ -935,17 +935,16 @@ public:
     // --- Backward-context export (used by cuda_sinkhorn_splr_bwd) ---
 
     // Snapshot the current sparsified Hessian CSR triple into the backward
-    // context. Must be called right after compute_search_direc(), so that
-    // the snapshot holds exactly the matrix consumed by the factorization.
+    // context. Retained for immediate-convergence fallback and debug/ablation
+    // baselines; the normal C2 path uses transfer_backward_state_to().
     void snapshot_sphess(SPLRBackwardContext& ctx, size_t nnz) const
     {
         ctx.snapshot_sphess(d_Hvalues, d_Hcolind, d_Hrowptr, nnz);
     }
 
     // Initialize the backward context from its private CSR snapshot and copy
-    // the low-rank materials (s, y, invA_y). The context performs its own
-    // analyze + factorization. The forward solver retains ownership of its
-    // cuDSS factorization and destroys it normally.
+    // the low-rank materials (s, y, invA_y). Retained as a debug/ablation
+    // baseline; the normal C2 path does not perform this extra factorization.
     void export_backward_context(
         SPLRBackwardContext& ctx, bool low_rank, double ys,
         bool with_validation
@@ -958,9 +957,9 @@ public:
     }
 
     // Transfer the forward-owned cuDSS state and all backing buffers needed
-    // by the backward preconditioner to the context. This helper is intended
-    // for the Stage-3B.2-C zero-extra-factorization path and is not called by
-    // the current main loop.
+    // by the backward preconditioner to the context. This is the Stage-3B.2-C2
+    // normal path: reuse the existing forward factorization with zero extra
+    // backward factorization.
     //
     // The transferred cuDSS wrappers depend on the following base allocations:
     //   d_Hvalues / d_Hcolind / d_Hrowptr
@@ -1280,19 +1279,19 @@ void cuda_sinkhorn_splr(
 // Backward-capable variant of cuda_sinkhorn_splr.
 //
 // The forward iteration is identical to cuda_sinkhorn_splr(), except that
-// 1. the CSR triple consumed by each factorization is snapshotted into the
-//    backward context right after compute_search_direc();
-// 2. when the loop exits, the context copies the low-rank secant materials
-//    and performs its own analyze + factorization on the last snapshot;
-// 3. if the loop is never entered (immediate convergence), the sparsified
+// 1. a normal path with at least one completed iteration transfers the last
+//    forward cuDSS factorization and its exact backing buffers into the
+//    backward context;
+// 2. if the loop is never entered (immediate convergence), the sparsified
 //    Hessian at the final point is factorized inside the context as a
 //    fallback, without the low-rank correction.
 //
-// Stage-3B.2-C1 note: delay the final dual_sphess() rebuild. Once the
-// updated point is known to be the last one, keep the forward CSR buffers and
-// cuDSS factorization associated with A_k instead of overwriting them with
-// A_{k+1}. Ownership handoff is still intentionally disabled; the backward
-// context continues to use snapshot + context-refactorization.
+// Stage-3B.2-C2 note: normal paths that completed at least one forward
+// factorization transfer the existing SparseCholeskySolver and its exact
+// backing buffers into the backward context. This reuses the forward cuDSS
+// factorization directly, so the normal path performs zero extra backward
+// factorization. Immediate-convergence fallback still uses snapshot +
+// context-refactorization because no forward factorization exists.
 void cuda_sinkhorn_splr_bwd(
     const double* M, const double* a, const double* b, double* P,
     double reg, int max_iter, double tol, int n, int m, int* niter,
@@ -1412,13 +1411,6 @@ void cuda_sinkhorn_splr_bwd(
         }
         solver.compute_search_direc(nnz, ys, low_rank, analyze_pattern, verbose);
         timer_inner.toc("search_direc");
-
-        // Snapshot the CSR triple that has just been factorized, so that the
-        // backward context holds exactly the matrix consumed by cuDSS
-        if (ctx != nullptr)
-        {
-            solver.snapshot_sphess(*ctx, nnz);
-        }
 
         // Line search will overwrite d_gamma and d_grad, so
         // save d_gamma to d_gamma_prev, and d_grad to d_grad_prev
@@ -1564,16 +1556,18 @@ void cuda_sinkhorn_splr_bwd(
         }
         else if (*niter > 0)
         {
-            // Initialize from the last CSR snapshot (made at d_gamma_prev),
-            // together with the low-rank materials of the last completed
-            // iteration. The context refactorizes the snapshot internally.
-            solver.export_backward_context(*ctx, low_rank, ys, with_validation);
+            // Normal path: transfer the existing forward factorization of A_k
+            // and its exact backing buffers into the context. No fresh
+            // analyze/factorize is performed for the backward context.
+            solver.transfer_backward_state_to(
+                *ctx, nnz, ys, low_rank, with_validation
+            );
         }
         else
         {
             // Immediate convergence: no factorization was ever made.
             // Factorize the sparsified Hessian at the final point inside
-            // the context, without the low-rank correction
+            // the context, without the low-rank correction.
             solver.snapshot_sphess(*ctx, nnz);
             ctx->factorize_fallback(
                 reg, with_validation ? solver.current_point() : nullptr

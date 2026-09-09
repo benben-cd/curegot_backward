@@ -358,9 +358,9 @@ void SPLRBackwardContext::initialize_from_snapshot(
         ));
     }
 
-    // Fresh factorization of the owned snapshot. This is the conservative
-    // Stage-3B.1 correctness baseline; true forward-factorization ownership
-    // transfer is intentionally left for a later stage.
+    // Fresh factorization of the owned snapshot. This path is retained for
+    // fallback/debug validation; the normal Stage-3B.2-C2 path instead adopts
+    // the forward factorization directly.
     factorize_snapshot();
     m_valid = true;
 }

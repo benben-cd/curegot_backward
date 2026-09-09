@@ -242,6 +242,10 @@ class EmulatedContext:
         return self._fallback
 
     @property
+    def adopted_forward_state(self):
+        return False
+
+    @property
     def ys(self):
         return self._ys
 
@@ -506,7 +510,8 @@ def run_all(name, plan, dual, niter, converged, ctx, M, eta, n, m, device,
     print(f"\n=== {name} ===")
     print(f"forward: niter = {niter}, converged = {converged}")
     print(f"context: dim = {ctx.dim}, low_rank = {ctx.low_rank_enabled}, "
-          f"fallback = {ctx.is_fallback}, reg = {ctx.reg}")
+          f"fallback = {ctx.is_fallback}, adopted = {ctx.adopted_forward_state}, "
+          f"reg = {ctx.reg}")
     if ctx.low_rank_enabled:
         print(f"context: ys = {ctx.ys:.6e}")
 
@@ -558,6 +563,11 @@ def main():
     plan, dual, niter, converged, ctx = forward(
         M, a, b, eta, tol=args.tol, max_iter=args.max_iter
     )
+    if not args.emulate:
+        if niter > 0 and not ctx.adopted_forward_state:
+            raise RuntimeError("normal path did not adopt the forward factorization")
+        if niter == 0 and ctx.adopted_forward_state:
+            raise RuntimeError("immediate-convergence path unexpectedly adopted forward state")
     ok1 = run_all("Test 1 (normal)", plan, dual, niter, converged, ctx,
                   M, eta, n, m, device)
 
@@ -566,7 +576,10 @@ def main():
         M, a, b, eta, tol=args.tol, max_iter=args.max_iter, x0=dual
     )
     print(f"\n[fallback check] niter = {niter2}, "
-          f"is_fallback = {ctx2.is_fallback}")
+          f"is_fallback = {ctx2.is_fallback}, "
+          f"adopted = {ctx2.adopted_forward_state}")
+    if not args.emulate and ctx2.adopted_forward_state:
+        raise RuntimeError("fallback path unexpectedly adopted a forward factorization")
     ok2 = run_all("Test 2 (fallback)", plan2, dual2, niter2, converged2, ctx2,
                   M, eta, n, m, device)
 
