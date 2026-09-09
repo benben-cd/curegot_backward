@@ -33,6 +33,15 @@ void cuda_sinkhorn_splr(
 //                 ||grad|| < tol
 // with_validation: if true, the context also stores the point at which
 //                 the factorization was made (for L0/L1 validation)
+// snapshot_baseline: debug/benchmark-only switch (Stage 3C-1). When false
+//                 (default), a normal path with at least one completed
+//                 iteration transfers the existing forward cuDSS
+//                 factorization into the context (zero extra factorization).
+//                 When true, the normal path instead snapshots the CSR and
+//                 performs a fresh analyze + factorize inside the context
+//                 (Stage-3B.1 semantics) for ablation benchmarking. This
+//                 switch only affects the post-loop context export; the
+//                 forward iteration sequence is identical either way.
 class SPLRBackwardContext;
 void cuda_sinkhorn_splr_bwd(
     const double* M, const double* a, const double* b, double* P,
@@ -43,7 +52,8 @@ void cuda_sinkhorn_splr_bwd(
     bool input_on_device = false, bool output_on_device = false,
     SPLRBackwardContext* ctx = nullptr,
     bool* converged = nullptr,
-    bool with_validation = false
+    bool with_validation = false,
+    bool snapshot_baseline = false
 );
 
 

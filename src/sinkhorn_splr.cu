@@ -1292,6 +1292,13 @@ void cuda_sinkhorn_splr(
 // factorization directly, so the normal path performs zero extra backward
 // factorization. Immediate-convergence fallback still uses snapshot +
 // context-refactorization because no forward factorization exists.
+//
+// Stage-3C-1 note: snapshot_baseline is a debug/benchmark-only switch.
+// When true, the normal path exports the context with the old Stage-3B.1
+// semantics (CSR snapshot + fresh analyze/factorize inside the context)
+// instead of the ownership handoff, so that benchmarks can compare the two
+// context-construction strategies on identical forward iterates. The switch
+// does not affect the forward iteration sequence in any way.
 void cuda_sinkhorn_splr_bwd(
     const double* M, const double* a, const double* b, double* P,
     double reg, int max_iter, double tol, int n, int m, int* niter,
@@ -1299,7 +1306,8 @@ void cuda_sinkhorn_splr_bwd(
     int sparsity_pattern_cycle, int candidate_sinkhorn_iter, int verbose,
     const double* x0, double* dual,
     bool input_on_device, bool output_on_device,
-    SPLRBackwardContext* ctx, bool* converged, bool with_validation
+    SPLRBackwardContext* ctx, bool* converged, bool with_validation,
+    bool snapshot_baseline
 )
 {
     // Algorithmic parameters
@@ -1556,12 +1564,27 @@ void cuda_sinkhorn_splr_bwd(
         }
         else if (*niter > 0)
         {
-            // Normal path: transfer the existing forward factorization of A_k
-            // and its exact backing buffers into the context. No fresh
-            // analyze/factorize is performed for the backward context.
-            solver.transfer_backward_state_to(
-                *ctx, nnz, ys, low_rank, with_validation
-            );
+            if (snapshot_baseline)
+            {
+                // Debug/benchmark baseline (Stage-3B.1 semantics): snapshot
+                // the CSR of A_k into the context and let the context run a
+                // fresh analyze + factorize, in addition to the forward
+                // factorization that remains owned by the solver. Only used
+                // for Stage-3C-1 ablation benchmarks.
+                solver.snapshot_sphess(*ctx, nnz);
+                solver.export_backward_context(
+                    *ctx, low_rank, ys, with_validation
+                );
+            }
+            else
+            {
+                // Normal path: transfer the existing forward factorization of
+                // A_k and its exact backing buffers into the context. No fresh
+                // analyze/factorize is performed for the backward context.
+                solver.transfer_backward_state_to(
+                    *ctx, nnz, ys, low_rank, with_validation
+                );
+            }
         }
         else
         {

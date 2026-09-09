@@ -524,6 +524,25 @@ py::dict torch_sinkhorn_splr_bwd(
         return_validation = py::cast<bool>(kwargs["return_validation"]);
     }
 
+    // Get context_mode from kwargs (Stage-3C-1 benchmark/debug only).
+    // "adopt" (default): transfer the forward factorization into the context
+    // (zero extra factorization). "snapshot": Stage-3B.1 baseline semantics
+    // (CSR snapshot + fresh context analyze/factorize) for ablation
+    // benchmarking. This only affects the post-loop context export, never
+    // the forward iteration sequence.
+    std::string context_mode = "adopt";
+    if (kwargs.contains("context_mode"))
+    {
+        context_mode = py::cast<std::string>(kwargs["context_mode"]);
+    }
+    if (context_mode != "adopt" && context_mode != "snapshot")
+    {
+        throw std::runtime_error(
+            "context_mode must be \"adopt\" or \"snapshot\""
+        );
+    }
+    const bool snapshot_baseline = (context_mode == "snapshot");
+
     // Create output tensors that are double and on device
     torch::Tensor P = torch::empty({n, m}, options);
     torch::Tensor dual = torch::empty(n + m, options);
@@ -548,7 +567,7 @@ py::dict torch_sinkhorn_splr_bwd(
         sparsity_pattern_cycle, candidate_sinkhorn_iter, verbose,
         d_x0_ptr, d_dual_ptr,
         true, true,
-        &ctx, &converged, return_validation
+        &ctx, &converged, return_validation, snapshot_baseline
     );
 
     if (!ctx.is_valid())

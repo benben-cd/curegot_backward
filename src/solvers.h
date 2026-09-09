@@ -28,5 +28,6 @@ void cuda_sinkhorn_splr_bwd(
     bool input_on_device = false, bool output_on_device = false,
     SPLRBackwardContext* ctx = nullptr,
     bool* converged = nullptr,
-    bool with_validation = false
+    bool with_validation = false,
+    bool snapshot_baseline = false
 );
