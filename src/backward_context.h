@@ -203,6 +203,45 @@ public:
         const double* d_r, double* d_z, int repeats
     );
 
+    // -------- Debug/benchmark-only base-solve profiling (Stage 3C-2B) -----
+    // Pure A^{-1} r path: identical to apply_preconditioner() WITHOUT the
+    // low-rank Woodbury correction, i.e.
+    //   memcpy d_rhs <- d_r; m_solver->solve(); stream sync; memcpy d_z <- d_sol.
+    // The field names reflect the REAL stages of SparseCholeskySolver::solve()
+    // as implemented in linsolve.cu: solve() is a single
+    // cudssExecute(CUDSS_PHASE_SOLVE) call -- there is no descriptor
+    // rebinding, no config/data update and no synchronization inside it, so
+    // no such fields exist here (they would be fabricated zeros).
+    struct BaseSolveProfile
+    {
+        double host_memcpy_in_us = 0.0;     // cudaMemcpy d_rhs <- d_r
+        // Host wall time spent inside m_solver->solve(), i.e. inside the
+        // single cudssExecute(PHASE_SOLVE) API call. NOT a pure launch
+        // overhead: cuDSS may block the host for part or all of the GPU
+        // solve depending on its internal scheduling (measured, not assumed).
+        double host_cudss_execute_us = 0.0;
+        double host_sync_wait_us = 0.0;     // final cudaStreamSynchronize
+        double host_memcpy_out_us = 0.0;    // cudaMemcpy d_z <- d_sol
+        double host_total_us = 0.0;         // whole C++ function
+        double gpu_solve_us = 0.0;          // CUDA events around the solve
+    };
+
+    // Debug/benchmark-only: profiled base solve. Event create/destroy happen
+    // inside the call, so host_total is slightly inflated relative to an
+    // uninstrumented call; the GPU event time is the primary output.
+    void apply_base_solve_profiled(
+        const double* d_r, double* d_z, BaseSolveProfile& profile
+    );
+
+    // Debug/benchmark-only: C++ loop over the uninstrumented base-solve
+    // sequence (memcpy_in; solve; sync; memcpy_out) `repeats` times on the
+    // same r/z buffers; returns the total host wall time in microseconds.
+    // This is the steady-state repeated-solve cost without per-call event
+    // create/destroy overhead.
+    double benchmark_base_solve_repeated(
+        const double* d_r, double* d_z, int repeats
+    );
+
     // Metadata
     bool   is_valid()       const { return m_valid; }
     bool   is_fallback()    const { return m_fallback; }

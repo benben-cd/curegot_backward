@@ -693,3 +693,104 @@ double SPLRBackwardContext::benchmark_preconditioner_repeated(
     const auto t1 = clock::now();
     return std::chrono::duration<double, std::micro>(t1 - t0).count();
 }
+
+// Debug/benchmark-only (Stage 3C-2B). Pure A^{-1} r: identical to
+// apply_preconditioner() minus the low-rank Woodbury correction, plus
+// chrono/CUDA-event instrumentation. Source-level fact (linsolve.cu):
+// SparseCholeskySolver::solve() is a single cudssExecute(CUDSS_PHASE_SOLVE)
+// -- no descriptor rebinding, no config/data update, no sync inside.
+void SPLRBackwardContext::apply_base_solve_profiled(
+    const double* d_r, double* d_z, BaseSolveProfile& profile
+)
+{
+    if (!m_valid || !m_solver)
+    {
+        fprintf(stderr, "SPLRBackwardContext: invalid context\n");
+        exit(EXIT_FAILURE);
+    }
+
+    cudaStream_t stream = m_solver->get_cuda_stream();
+
+    cudaEvent_t ev_solve_start, ev_solve_stop;
+    CUDA_CHECK(cudaEventCreate(&ev_solve_start));
+    CUDA_CHECK(cudaEventCreate(&ev_solve_stop));
+
+    using clock = std::chrono::steady_clock;
+    auto us = [](const clock::time_point& a, const clock::time_point& b) {
+        return std::chrono::duration<double, std::micro>(b - a).count();
+    };
+
+    const auto t_total0 = clock::now();
+
+    const auto t0 = clock::now();
+    CUDA_CHECK(cudaMemcpy(
+        d_rhs, d_r, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
+    ));
+    const auto t1 = clock::now();
+
+    // Cholesky solve: d_sol = A^{-1} r. host_cudss_execute_us is the host
+    // wall time inside the cuDSS API call; it is NOT pure launch overhead
+    // (cuDSS may block the host until part or all of the GPU solve is done).
+    CUDA_CHECK(cudaEventRecord(ev_solve_start, stream));
+    const auto t2 = clock::now();
+    m_solver->solve();
+    const auto t3 = clock::now();
+    CUDA_CHECK(cudaEventRecord(ev_solve_stop, stream));
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const auto t4 = clock::now();
+
+    CUDA_CHECK(cudaMemcpy(
+        d_z, d_sol, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
+    ));
+    const auto t5 = clock::now();
+
+    float solve_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&solve_ms, ev_solve_start, ev_solve_stop));
+    CUDA_CHECK(cudaEventDestroy(ev_solve_start));
+    CUDA_CHECK(cudaEventDestroy(ev_solve_stop));
+
+    profile.host_memcpy_in_us = us(t0, t1);
+    profile.host_cudss_execute_us = us(t2, t3);
+    profile.host_sync_wait_us = us(t3, t4);
+    profile.host_memcpy_out_us = us(t4, t5);
+    profile.host_total_us = us(t_total0, t5);
+    profile.gpu_solve_us = (double)solve_ms * 1e3;
+}
+
+// Debug/benchmark-only (Stage 3C-2B). C++ loop over the uninstrumented
+// base-solve sequence; returns the total host wall time in microseconds.
+double SPLRBackwardContext::benchmark_base_solve_repeated(
+    const double* d_r, double* d_z, int repeats
+)
+{
+    if (!m_valid || !m_solver)
+    {
+        fprintf(stderr, "SPLRBackwardContext: invalid context\n");
+        exit(EXIT_FAILURE);
+    }
+    if (repeats <= 0)
+    {
+        return 0.0;
+    }
+
+    cudaStream_t stream = m_solver->get_cuda_stream();
+
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    for (int i = 0; i < repeats; i++)
+    {
+        // Same sequence as the non-low-rank portion of the production
+        // apply_preconditioner().
+        CUDA_CHECK(cudaMemcpy(
+            d_rhs, d_r, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
+        ));
+        m_solver->solve();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaMemcpy(
+            d_z, d_sol, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
+        ));
+    }
+    const auto t1 = clock::now();
+    return std::chrono::duration<double, std::micro>(t1 - t0).count();
+}
