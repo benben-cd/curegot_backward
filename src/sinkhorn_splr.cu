@@ -107,6 +107,8 @@ void launch_low_rank(
 
 // Helper function to compute search direction with low-rank terms
 // From sinkhorn_splr_kernel_low_rank.cu
+// The trailing profile argument is debug/benchmark-only (Stage 3C-2A);
+// production call sites pass nothing and run exactly as before.
 void launch_low_rank_search_direc(
     double* d_direc,
     const double* d_invA_y,
@@ -117,7 +119,8 @@ void launch_low_rank_search_direc(
     double reg,
     int size,
     double* h_pinned,
-    cudaStream_t stream = cudaStreamPerThread
+    cudaStream_t stream = cudaStreamPerThread,
+    LowRankSearchDirecProfile* profile = nullptr
 );
 
 // Class for the SPLR solver

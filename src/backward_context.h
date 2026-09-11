@@ -6,6 +6,40 @@
 
 #include "linsolve.h"
 
+// Debug/benchmark-only timing breakdown of launch_low_rank_search_direc()
+// (Stage 3C-2A). Defined here so that the kernel implementation
+// (sinkhorn_splr_kernel_low_rank.cu), the forward solver declaration
+// (sinkhorn_splr.cu) and SPLRBackwardContext share a single definition.
+//
+// Real implementation structure (confirmed against the kernel source):
+//   1. cudaHostGetDevicePointer + search_direc_dot_kernel launch (async);
+//   2. cudaStreamSynchronize(stream)  <-- blocking: the dot kernel is queued
+//      after the cuDSS solve on the same stream, so this wait absorbs any
+//      still-running solve work plus the dot kernel;
+//   3. host partial-sum reduction + scalar arithmetic (sg_ys, term1, term2);
+//   4. update_direc_kernel launch (async).
+struct LowRankSearchDirecProfile
+{
+    // Host wall times (std::chrono::steady_clock, microseconds)
+    double setup_launch_host_us = 0.0;      // step 1
+    double sync_wait_host_us = 0.0;         // step 2; absorbs the GPU solve
+                                            // wait when the solve is still
+                                            // running -- NOT pure sync overhead
+    double host_scalar_us = 0.0;            // step 3
+    double correction_launch_host_us = 0.0; // step 4
+    // GPU times (CUDA events on the working stream, microseconds), queried
+    // by the caller after synchronizing the stream
+    double gpu_reduce_us = 0.0;             // search_direc_dot_kernel
+    double gpu_correction_us = 0.0;         // update_direc_kernel
+    // Events recorded by the helper. They are created, queried and destroyed
+    // by the CALLER (the context profiling path); all nullptr when the
+    // helper runs unprofiled (production).
+    cudaEvent_t ev_reduce_start = nullptr;
+    cudaEvent_t ev_reduce_stop = nullptr;
+    cudaEvent_t ev_corr_start = nullptr;
+    cudaEvent_t ev_corr_stop = nullptr;
+};
+
 // Backward-propagation context for the SPLR solver.
 //
 // The backward pass of entropic-regularized OT requires solving linear
@@ -119,6 +153,55 @@ public:
     // Compute z = B^{-1} r. d_r and d_z are device pointers of length
     // problem_size. Synchronous with respect to the host.
     void apply_preconditioner(const double* d_r, double* d_z);
+
+    // -------- Debug/benchmark-only profiling interface (Stage 3C-2A) ------
+    // The methods below instrument the SAME execution path as
+    // apply_preconditioner(); the production method above is unchanged and
+    // gains no extra synchronization or events.
+
+    // Timing breakdown of a single apply_preconditioner call.
+    // Host times: std::chrono::steady_clock wall time of each blocking step.
+    // GPU times: CUDA events recorded on the solver's working stream.
+    struct PreconditionerProfile
+    {
+        // Host wall time per step (microseconds)
+        double host_memcpy_in_us = 0.0;       // cudaMemcpy d_rhs <- d_r
+        double host_solve_launch_us = 0.0;    // cuDSS solve API call (async)
+        double host_lowrank_total_us = 0.0;   // whole launch_low_rank_search_direc call
+        double host_final_sync_wait_us = 0.0; // final cudaStreamSynchronize
+        double host_memcpy_out_us = 0.0;      // cudaMemcpy d_z <- d_sol
+        double host_total_us = 0.0;           // whole C++ function
+        // GPU elapsed time on the solver stream (microseconds, CUDA events)
+        double gpu_cudss_solve_us = 0.0;
+        // Low-rank stage split; all zeros when low-rank is disabled.
+        // Attribution note: in low-rank mode the GPU solve is normally waited
+        // on INSIDE the helper's internal cudaStreamSynchronize (reported as
+        // lowrank.sync_wait_host_us), so host_final_sync_wait_us then only
+        // covers the correction kernel. The true GPU solve time is
+        // gpu_cudss_solve_us regardless of where the host wait happens.
+        bool low_rank_active = false;
+        LowRankSearchDirecProfile lowrank;
+    };
+
+    // Debug/benchmark-only: identical math and execution order to
+    // apply_preconditioner(), plus chrono/CUDA-event instrumentation. Unlike
+    // the production path, this variant creates and destroys CUDA events
+    // inside the call, so its host_total is slightly inflated relative to
+    // production; the GPU event times are the primary output.
+    void apply_preconditioner_profiled(
+        const double* d_r, double* d_z, PreconditionerProfile& profile
+    );
+
+    // Debug/benchmark-only: call the production apply_preconditioner()
+    // `repeats` times in a C++ loop on the same r/z buffers and return the
+    // total host wall time in microseconds. Compared against a Python loop
+    // over the public API, this isolates the Python/PyBind/tensor-wrapper
+    // per-call overhead. Note that the production per-call
+    // cudaStreamSynchronize and memcpys remain inside the loop; the ratio
+    // does not capture those.
+    double benchmark_preconditioner_repeated(
+        const double* d_r, double* d_z, int repeats
+    );
 
     // Metadata
     bool   is_valid()       const { return m_valid; }

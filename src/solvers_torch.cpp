@@ -4,6 +4,7 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -316,6 +317,105 @@ torch::Tensor ctx_apply_preconditioner(SPLRBackwardContext& ctx, torch::Tensor r
     return z;
 }
 
+// Debug/benchmark-only (Stage 3C-2A): profiled variant of
+// apply_preconditioner. Same math and execution order; returns the output
+// tensor plus a host/GPU timing breakdown. The production
+// apply_preconditioner is unchanged.
+py::dict ctx_profile_preconditioner(SPLRBackwardContext& ctx, torch::Tensor r)
+{
+    if (!ctx.is_valid())
+    {
+        throw std::runtime_error("SPLRBackwardContext: invalid context");
+    }
+    if (r.dim() != 1 || r.size(0) != ctx.problem_size())
+    {
+        throw std::runtime_error("SPLRBackwardContext: r must be a 1D tensor of length n + m - 1");
+    }
+    if (!r.is_cuda())
+    {
+        throw std::runtime_error("SPLRBackwardContext: r must be a CUDA tensor");
+    }
+
+    auto options = torch::TensorOptions().dtype(torch::kFloat64).device(r.device());
+    r = r.to(options).contiguous();
+
+    const at::cuda::CUDAGuard device_guard(r.device());
+
+    const auto t_w0 = std::chrono::steady_clock::now();
+    torch::Tensor z = torch::empty(ctx.problem_size(), options);
+
+    SPLRBackwardContext::PreconditionerProfile prof;
+    ctx.apply_preconditioner_profiled(
+        r.data_ptr<double>(), z.data_ptr<double>(), prof
+    );
+    const auto t_w1 = std::chrono::steady_clock::now();
+
+    py::dict out;
+    out["output"] = z;
+    out["host_wrapper_us"] =
+        std::chrono::duration<double, std::micro>(t_w1 - t_w0).count();
+    out["host_memcpy_in_us"] = prof.host_memcpy_in_us;
+    out["host_solve_launch_us"] = prof.host_solve_launch_us;
+    out["host_lowrank_total_us"] = prof.host_lowrank_total_us;
+    out["host_final_sync_wait_us"] = prof.host_final_sync_wait_us;
+    out["host_memcpy_out_us"] = prof.host_memcpy_out_us;
+    out["host_total_us"] = prof.host_total_us;
+    out["gpu_cudss_solve_us"] = prof.gpu_cudss_solve_us;
+    out["low_rank_active"] = prof.low_rank_active;
+    out["lowrank_setup_launch_host_us"] = prof.lowrank.setup_launch_host_us;
+    out["lowrank_sync_wait_host_us"] = prof.lowrank.sync_wait_host_us;
+    out["lowrank_host_scalar_us"] = prof.lowrank.host_scalar_us;
+    out["lowrank_correction_launch_host_us"] =
+        prof.lowrank.correction_launch_host_us;
+    out["lowrank_reduce_gpu_us"] = prof.lowrank.gpu_reduce_us;
+    out["lowrank_correction_gpu_us"] = prof.lowrank.gpu_correction_us;
+    return out;
+}
+
+// Debug/benchmark-only (Stage 3C-2A): C++ loop over the production
+// apply_preconditioner on the same RHS. Compared against a Python loop over
+// the public API, this isolates the Python/PyBind/tensor-wrapper per-call
+// overhead. Returns the output of the last repetition for correctness
+// comparison.
+py::dict ctx_benchmark_preconditioner_repeated(
+    SPLRBackwardContext& ctx, torch::Tensor r, int repeats
+)
+{
+    if (!ctx.is_valid())
+    {
+        throw std::runtime_error("SPLRBackwardContext: invalid context");
+    }
+    if (r.dim() != 1 || r.size(0) != ctx.problem_size())
+    {
+        throw std::runtime_error("SPLRBackwardContext: r must be a 1D tensor of length n + m - 1");
+    }
+    if (!r.is_cuda())
+    {
+        throw std::runtime_error("SPLRBackwardContext: r must be a CUDA tensor");
+    }
+    if (repeats <= 0)
+    {
+        throw std::runtime_error("repeats must be positive");
+    }
+
+    auto options = torch::TensorOptions().dtype(torch::kFloat64).device(r.device());
+    r = r.to(options).contiguous();
+
+    const at::cuda::CUDAGuard device_guard(r.device());
+    torch::Tensor z = torch::empty(ctx.problem_size(), options);
+
+    const double total_us = ctx.benchmark_preconditioner_repeated(
+        r.data_ptr<double>(), z.data_ptr<double>(), repeats
+    );
+
+    py::dict out;
+    out["output"] = z;
+    out["repeats"] = repeats;
+    out["cpp_repeated_total_us"] = total_us;
+    out["cpp_per_call_us"] = total_us / (double)repeats;
+    return out;
+}
+
 // Validation-only accessors. All of them return copies, so the returned
 // tensors are independent of the context lifetime.
 torch::Tensor ctx_csr_values(SPLRBackwardContext& ctx)
@@ -394,6 +494,14 @@ void register_backward_context(py::module_& m)
         "preconditioner for the backward PCG.")
         .def("apply_preconditioner", &ctx_apply_preconditioner, py::arg("r"),
             "Compute z = B^{-1} r. r must be a 1D float64 CUDA tensor of length n + m - 1.")
+        // Debug/benchmark-only profiling APIs (Stage 3C-2A)
+        .def("profile_preconditioner", &ctx_profile_preconditioner, py::arg("r"),
+            "Debug/benchmark-only: profiled variant of apply_preconditioner. "
+            "Returns a dict with the output tensor and a host/GPU timing breakdown.")
+        .def("benchmark_preconditioner_repeated", &ctx_benchmark_preconditioner_repeated,
+            py::arg("r"), py::arg("repeats"),
+            "Debug/benchmark-only: C++ loop over apply_preconditioner on the "
+            "same RHS; returns per-call timing and the last output.")
         .def_property_readonly("reg", &SPLRBackwardContext::reg)
         .def_property_readonly("dim", &SPLRBackwardContext::problem_size)
         .def_property_readonly("low_rank_enabled", &SPLRBackwardContext::low_rank)

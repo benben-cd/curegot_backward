@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cmath>
+#include <chrono>
 
 // CUDA headers
 #include <cuda_runtime.h>
@@ -7,6 +8,9 @@
 
 // Utility functions
 #include "utils.h"
+
+// LowRankSearchDirecProfile (Stage 3C-2A debug/benchmark-only instrumentation)
+#include "backward_context.h"
 
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
@@ -285,6 +289,10 @@ __global__ void update_direc_kernel(
 // In: d_y          [size]
 // In: d_s          [size]
 // Work: h_pinned   [3*MAX_NUM_BLOCK_1D]
+// The trailing profile argument is debug/benchmark-only (Stage 3C-2A). When
+// non-null the helper records chrono host timings and caller-owned CUDA
+// events around its four real stages; the numerical work, the kernel launch
+// order and the internal cudaStreamSynchronize are IDENTICAL either way.
 void launch_low_rank_search_direc(
     double* d_direc,
     const double* d_invA_y,
@@ -295,9 +303,17 @@ void launch_low_rank_search_direc(
     double reg,
     int size,
     double* h_pinned,
-    cudaStream_t stream = cudaStreamPerThread
+    cudaStream_t stream = cudaStreamPerThread,
+    LowRankSearchDirecProfile* profile = nullptr
 )
 {
+    using clock = std::chrono::steady_clock;
+    auto us = [](const clock::time_point& a, const clock::time_point& b) {
+        return std::chrono::duration<double, std::micro>(b - a).count();
+    };
+    clock::time_point t0, t1, t2, t3, t4;
+    if (profile) t0 = clock::now();
+
     // Get device pointer to the pinned memory
     double* d_block_result;
     cudaHostGetDevicePointer(&d_block_result, h_pinned, 0);
@@ -316,12 +332,23 @@ void launch_low_rank_search_direc(
     // The grid-stride loop in search_direc_dot_kernel() will handle larger sizes
     numBlocks = std::min(numBlocks, 256);
 
+    if (profile) cudaEventRecord(profile->ev_reduce_start, stream);
     search_direc_dot_kernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
         d_s, d_g, d_y, d_invA_y, d_direc,
         d_block_sg, d_block_yinvAy, d_block_yinvAg,
         size
     );
+    if (profile)
+    {
+        cudaEventRecord(profile->ev_reduce_stop, stream);
+        t1 = clock::now();
+    }
+    // NOTE: this sync is where the host actually waits for the cuDSS solve
+    // in low-rank mode -- the dot kernel is queued behind the solve on the
+    // same stream. Measured as profile->sync_wait_host_us; it is NOT pure
+    // synchronization overhead.
     cudaStreamSynchronize(stream);
+    if (profile) t2 = clock::now();
 
     // Compute final result on CPU
     double sg = 0.0, yinvAy = 0.0, yinvAg = 0.0;
@@ -340,7 +367,24 @@ void launch_low_rank_search_direc(
     const double term2 = sg_ys;
 
     // Call second kernel function
+    if (profile)
+    {
+        t3 = clock::now();
+        cudaEventRecord(profile->ev_corr_start, stream);
+    }
     update_direc_kernel<<<numBlocks, threadsPerBlock, 0, stream>>>(
         d_s, d_invA_y, term1, term2, d_direc, size
     );
+    if (profile)
+    {
+        cudaEventRecord(profile->ev_corr_stop, stream);
+        t4 = clock::now();
+        profile->setup_launch_host_us = us(t0, t1);
+        profile->sync_wait_host_us = us(t1, t2);
+        profile->host_scalar_us = us(t2, t3);
+        profile->correction_launch_host_us = us(t3, t4);
+        // gpu_reduce_us / gpu_correction_us are filled by the caller after
+        // it synchronizes the stream (the correction kernel is still in
+        // flight here, so cudaEventElapsedTime would be premature).
+    }
 }

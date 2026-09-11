@@ -1,5 +1,6 @@
 #include "backward_context.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -23,6 +24,10 @@
 //   sg = s^T g, yinvAy = y^T invA_y, yinvAg = y^T (A^{-1} g)
 //   sg_ys = sg / ys
 //   direc += ((1/reg + yinvAy/ys) * sg_ys - yinvAg/ys) * s - sg_ys * invA_y
+// The trailing profile argument is debug/benchmark-only (Stage 3C-2A):
+// when non-null, the helper records chrono host timings and CUDA events
+// (created/owned by the caller) around its internal stages. Production
+// call sites pass nothing and run exactly as before.
 void launch_low_rank_search_direc(
     double* d_direc,
     const double* d_invA_y,
@@ -33,7 +38,8 @@ void launch_low_rank_search_direc(
     double reg,
     int size,
     double* h_pinned,
-    cudaStream_t stream
+    cudaStream_t stream,
+    LowRankSearchDirecProfile* profile = nullptr
 );
 
 SPLRBackwardContext::SPLRBackwardContext(int problem_size, int max_nnz) :
@@ -526,4 +532,164 @@ void SPLRBackwardContext::apply_preconditioner(const double* d_r, double* d_z)
     CUDA_CHECK(cudaMemcpy(
         d_z, d_sol, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
     ));
+}
+
+// Debug/benchmark-only (Stage 3C-2A). Identical math and execution order to
+// apply_preconditioner(); the only additions are std::chrono host timing and
+// CUDA events on the solver stream.
+//
+// Caller-owned events: every event used anywhere along the call (including
+// the ones recorded INSIDE launch_low_rank_search_direc) is created here,
+// passed to the helper through profile.lowrank.ev_*, queried here after the
+// stream has been synchronized, and destroyed here. This is required because
+// cudaEventElapsedTime needs both events to have completed, while the
+// correction kernel is still in flight when the helper returns.
+//
+// Attribution note (measured structure of the real code path):
+// launch_low_rank_search_direc contains an INTERNAL cudaStreamSynchronize
+// between its dot kernel and its host-side scalar merge. In low-rank mode
+// that internal sync is where the host actually waits for the cuDSS solve
+// (the dot kernel is queued behind the solve on the same stream), so
+// lowrank.sync_wait_host_us absorbs the remaining GPU solve time. The
+// final cudaStreamSynchronize below then only waits for the correction
+// kernel. gpu_cudss_solve_us measures the true GPU solve time regardless
+// of which host call happens to wait for it.
+void SPLRBackwardContext::apply_preconditioner_profiled(
+    const double* d_r, double* d_z, PreconditionerProfile& profile
+)
+{
+    if (!m_valid || !m_solver)
+    {
+        fprintf(stderr, "SPLRBackwardContext: invalid context\n");
+        exit(EXIT_FAILURE);
+    }
+
+    cudaStream_t stream = m_solver->get_cuda_stream();
+
+    profile.low_rank_active = m_low_rank;
+    profile.lowrank = LowRankSearchDirecProfile{};  // zero-reset for reuse
+
+    cudaEvent_t ev_solve_start, ev_solve_stop;
+    CUDA_CHECK(cudaEventCreate(&ev_solve_start));
+    CUDA_CHECK(cudaEventCreate(&ev_solve_stop));
+    if (m_low_rank)
+    {
+        CUDA_CHECK(cudaEventCreate(&profile.lowrank.ev_reduce_start));
+        CUDA_CHECK(cudaEventCreate(&profile.lowrank.ev_reduce_stop));
+        CUDA_CHECK(cudaEventCreate(&profile.lowrank.ev_corr_start));
+        CUDA_CHECK(cudaEventCreate(&profile.lowrank.ev_corr_stop));
+    }
+
+    using clock = std::chrono::steady_clock;
+    auto us = [](const clock::time_point& a, const clock::time_point& b) {
+        return std::chrono::duration<double, std::micro>(b - a).count();
+    };
+
+    const auto t_total0 = clock::now();
+
+    // Copy r into the persistent rhs buffer (same blocking call as the
+    // production path).
+    const auto t0 = clock::now();
+    CUDA_CHECK(cudaMemcpy(
+        d_rhs, d_r, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
+    ));
+    const auto t1 = clock::now();
+
+    // Cholesky solve: d_sol = A^{-1} r (async on the solver stream)
+    CUDA_CHECK(cudaEventRecord(ev_solve_start, stream));
+    m_solver->solve();
+    CUDA_CHECK(cudaEventRecord(ev_solve_stop, stream));
+    const auto t2 = clock::now();
+
+    // Rank-2 Woodbury correction (same call as the production path; the
+    // profile argument only turns on instrumentation inside the helper).
+    if (m_low_rank)
+    {
+        launch_low_rank_search_direc(
+            d_sol, d_invA_y, d_rhs, d_y, d_s,
+            m_ys, m_reg, m_Hsize, h_pinned, stream,
+            &profile.lowrank
+        );
+    }
+    const auto t3 = clock::now();
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const auto t4 = clock::now();
+
+    CUDA_CHECK(cudaMemcpy(
+        d_z, d_sol, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
+    ));
+    const auto t5 = clock::now();
+
+    // All recorded events have completed at this point (the stream was
+    // synchronized above).
+    float solve_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&solve_ms, ev_solve_start, ev_solve_stop));
+    if (m_low_rank)
+    {
+        float reduce_ms = 0.0f, corr_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(
+            &reduce_ms, profile.lowrank.ev_reduce_start,
+            profile.lowrank.ev_reduce_stop
+        ));
+        CUDA_CHECK(cudaEventElapsedTime(
+            &corr_ms, profile.lowrank.ev_corr_start,
+            profile.lowrank.ev_corr_stop
+        ));
+        profile.lowrank.gpu_reduce_us = (double)reduce_ms * 1e3;
+        profile.lowrank.gpu_correction_us = (double)corr_ms * 1e3;
+    }
+
+    CUDA_CHECK(cudaEventDestroy(ev_solve_start));
+    CUDA_CHECK(cudaEventDestroy(ev_solve_stop));
+    if (m_low_rank)
+    {
+        CUDA_CHECK(cudaEventDestroy(profile.lowrank.ev_reduce_start));
+        CUDA_CHECK(cudaEventDestroy(profile.lowrank.ev_reduce_stop));
+        CUDA_CHECK(cudaEventDestroy(profile.lowrank.ev_corr_start));
+        CUDA_CHECK(cudaEventDestroy(profile.lowrank.ev_corr_stop));
+        profile.lowrank.ev_reduce_start = nullptr;
+        profile.lowrank.ev_reduce_stop = nullptr;
+        profile.lowrank.ev_corr_start = nullptr;
+        profile.lowrank.ev_corr_stop = nullptr;
+    }
+
+    profile.host_memcpy_in_us = us(t0, t1);
+    profile.host_solve_launch_us = us(t1, t2);
+    // Whole helper call. In low-rank mode this interval CONTAINS the host
+    // wait for (the remainder of) the GPU solve, because of the helper's
+    // internal cudaStreamSynchronize -- see the attribution note above.
+    profile.host_lowrank_total_us = m_low_rank ? us(t2, t3) : 0.0;
+    // In low-rank mode this only waits for the correction kernel; in
+    // non-low-rank mode it waits for the whole GPU solve.
+    profile.host_final_sync_wait_us = us(t3, t4);
+    profile.host_memcpy_out_us = us(t4, t5);
+    profile.host_total_us = us(t_total0, t5);
+    profile.gpu_cudss_solve_us = (double)solve_ms * 1e3;
+}
+
+// Debug/benchmark-only (Stage 3C-2A). C++ loop over the production
+// apply_preconditioner(); returns the total host wall time in microseconds.
+double SPLRBackwardContext::benchmark_preconditioner_repeated(
+    const double* d_r, double* d_z, int repeats
+)
+{
+    if (!m_valid || !m_solver)
+    {
+        fprintf(stderr, "SPLRBackwardContext: invalid context\n");
+        exit(EXIT_FAILURE);
+    }
+    if (repeats <= 0)
+    {
+        return 0.0;
+    }
+
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    for (int i = 0; i < repeats; i++)
+    {
+        apply_preconditioner(d_r, d_z);
+    }
+    const auto t1 = clock::now();
+    return std::chrono::duration<double, std::micro>(t1 - t0).count();
 }
