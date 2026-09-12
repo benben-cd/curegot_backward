@@ -112,6 +112,21 @@ def solve_backward(
     precond = select_preconditioner(ctx, preconditioner)
 
     mu = rhs_Q_scale(G, T, n, m)
+    if not bool(torch.any(mu)):
+        # Degenerate upstream gradient: Q lambda = 0 has the exact solution
+        # lambda = 0 (Q is SPD). Short-circuit instead of running PCG --
+        # the iterative loop would otherwise hit its p^T A p <= 0 breakdown
+        # guard on the zero start residual. This is exact, not an
+        # approximation, and does not touch any nonzero-G path.
+        lam = torch.zeros_like(mu)
+        grad = assemble_grad(T, G, lam, eta, n, m)
+        return {
+            "lambda": lam,
+            "grad": grad,
+            "iterations": 0,
+            "converged": True,
+            "preconditioner": preconditioner,
+        }
     matvec = lambda v: q_matvec(T, v, n, m)
     lam, iterations, converged = pcg(matvec, precond, mu, tol=tol,
                                      max_iter=max_iter)

@@ -79,7 +79,3 @@ def pcg(matvec, precond, b, tol=1e-12, max_iter=2000):
         p = z + (rz_new / rz) * p
         rz = rz_new
     return x, max_iter, False
-
-
-# ---------------------------------------------------------------------------
-# Rebuild the preconditioner B from the context exports
