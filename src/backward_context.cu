@@ -1,9 +1,12 @@
 #include "backward_context.h"
 
+#include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
+#include <vector>
 
 // CUDA error checking macro
 #define CUDA_CHECK(call) \
@@ -42,6 +45,34 @@ void launch_low_rank_search_direc(
     LowRankSearchDirecProfile* profile = nullptr
 );
 
+// Stage 3C-3 diagonal preconditioner kernels. Defined in
+// sinkhorn_splr_kernel_low_rank.cu (keeps this file free of <<< >>> so it
+// stays host-compiler syntax-checkable); no build-system changes needed.
+
+// One thread per row scans rowptr[row]..rowptr[row+1] for col == row and
+// writes inv_diag[row] = 1 / value. On any violation (missing diagonal,
+// non-positive or non-finite value) the kernel records the smallest failing
+// (row + 1) into d_err via atomicMin; d_err must be initialized to INT_MAX
+// by the caller (0 rows failing leaves it at INT_MAX).
+void launch_extract_inv_diag(
+    const double* d_values,
+    const int* d_colind,
+    const int* d_rowptr,
+    double* d_inv_diag,
+    int dim,
+    int* d_err,
+    cudaStream_t stream
+);
+
+// z[i] = inv_diag[i] * r[i]; asynchronous on `stream`.
+void launch_apply_diag_precond(
+    const double* d_inv_diag,
+    const double* d_r,
+    double* d_z,
+    int dim,
+    cudaStream_t stream
+);
+
 SPLRBackwardContext::SPLRBackwardContext(int problem_size, int max_nnz) :
     m_Hsize(problem_size), m_max_nnz(max_nnz)
 {
@@ -58,6 +89,11 @@ SPLRBackwardContext::SPLRBackwardContext(int problem_size, int max_nnz) :
     CUDA_CHECK(cudaMalloc(&d_s, m_Hsize * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_y, m_Hsize * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_invA_y, m_Hsize * sizeof(double)));
+
+    // Diagonal preconditioner buffer (Stage 3C-3): always context-owned,
+    // filled once by setup_diagonal_preconditioner() after the CSR is
+    // finalized. Not freed by release_replaceable_buffers().
+    CUDA_CHECK(cudaMalloc(&d_inv_diag, m_Hsize * sizeof(double)));
 
     // Snapshot mode owns all replaceable buffers allocated above.
     m_owns_csr = true;
@@ -126,6 +162,8 @@ void SPLRBackwardContext::release_buffers()
     // here; m_solver must already have been reset by the caller.
     release_replaceable_buffers();
     if (d_ctx_point != nullptr) { cudaFree(d_ctx_point);   d_ctx_point = nullptr; }
+    if (d_inv_diag  != nullptr) { cudaFree(d_inv_diag);    d_inv_diag = nullptr; }
+    m_inv_diag_ready = false;
     if (h_pinned    != nullptr) { cudaFreeHost(h_pinned);  h_pinned = nullptr; }
 }
 
@@ -160,6 +198,8 @@ SPLRBackwardContext::SPLRBackwardContext(SPLRBackwardContext&& other) noexcept :
     d_invA_y    = other.d_invA_y;
     d_ctx_point = other.d_ctx_point;
     h_pinned    = other.h_pinned;
+    d_inv_diag  = other.d_inv_diag;
+    m_inv_diag_ready = other.m_inv_diag_ready;
 
     // Leave the source empty
     other.m_Hsize = 0;
@@ -187,6 +227,8 @@ SPLRBackwardContext::SPLRBackwardContext(SPLRBackwardContext&& other) noexcept :
     other.d_invA_y = nullptr;
     other.d_ctx_point = nullptr;
     other.h_pinned = nullptr;
+    other.d_inv_diag = nullptr;
+    other.m_inv_diag_ready = false;
 }
 
 SPLRBackwardContext& SPLRBackwardContext::operator=(SPLRBackwardContext&& other) noexcept
@@ -226,6 +268,8 @@ SPLRBackwardContext& SPLRBackwardContext::operator=(SPLRBackwardContext&& other)
         d_invA_y    = other.d_invA_y;
         d_ctx_point = other.d_ctx_point;
         h_pinned    = other.h_pinned;
+        d_inv_diag  = other.d_inv_diag;
+        m_inv_diag_ready = other.m_inv_diag_ready;
 
         // Leave the source empty
         other.m_Hsize = 0;
@@ -253,6 +297,8 @@ SPLRBackwardContext& SPLRBackwardContext::operator=(SPLRBackwardContext&& other)
         other.d_invA_y = nullptr;
         other.d_ctx_point = nullptr;
         other.h_pinned = nullptr;
+        other.d_inv_diag = nullptr;
+        other.m_inv_diag_ready = false;
     }
     return *this;
 }
@@ -532,6 +578,120 @@ void SPLRBackwardContext::apply_preconditioner(const double* d_r, double* d_z)
     CUDA_CHECK(cudaMemcpy(
         d_z, d_sol, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3C-3: native diagonal preconditioner
+// ---------------------------------------------------------------------------
+
+// File-local helper: run the validated extraction once on `stream`.
+// Returns the smallest failing row index (0-based), or -1 on success.
+// Uses a temporary device int for the error flag; synchronizes `stream`
+// once to read it back. One-time setup cost only -- never on the PCG path.
+static int extract_inv_diag_validated(
+    const double* d_values, const int* d_colind, const int* d_rowptr,
+    double* d_inv_diag, int dim, cudaStream_t stream
+)
+{
+    int* d_err = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_err, sizeof(int)));
+    const int h_init = INT_MAX; // sentinel: "no failing row"
+    CUDA_CHECK(cudaMemcpyAsync(
+        d_err, &h_init, sizeof(int), cudaMemcpyHostToDevice, stream
+    ));
+    launch_extract_inv_diag(
+        d_values, d_colind, d_rowptr, d_inv_diag, dim, d_err, stream
+    );
+    int h_err = INT_MAX;
+    CUDA_CHECK(cudaMemcpyAsync(
+        &h_err, d_err, sizeof(int), cudaMemcpyDeviceToHost, stream
+    ));
+    // Ordered on the same stream; safe for both default and non-default
+    // PyTorch current streams (unlike a legacy-stream synchronous memcpy).
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(d_err));
+    return (h_err == INT_MAX) ? -1 : (h_err - 1);
+}
+
+void SPLRBackwardContext::setup_diagonal_preconditioner(cudaStream_t stream)
+{
+    if (!m_valid)
+    {
+        fprintf(stderr, "SPLRBackwardContext: diagonal setup on invalid context\n");
+        exit(EXIT_FAILURE);
+    }
+    if (m_inv_diag_ready)
+    {
+        return; // idempotent: extracted once per context
+    }
+    const int bad_row = extract_inv_diag_validated(
+        d_Avalues, d_Acolind, d_Arowptr, d_inv_diag, m_Hsize, stream
+    );
+    if (bad_row >= 0)
+    {
+        // Guaranteed not to happen by construction (sparsification keeps the
+        // diagonal and the shift makes it positive); a violation is a bug.
+        fprintf(stderr,
+                "SPLRBackwardContext: CSR diagonal missing/non-positive/"
+                "non-finite at row %d\n", bad_row);
+        exit(EXIT_FAILURE);
+    }
+    m_inv_diag_ready = true;
+}
+
+void SPLRBackwardContext::apply_diagonal_preconditioner(
+    const double* d_r, double* d_z, cudaStream_t stream
+) const
+{
+    if (!m_valid || !m_inv_diag_ready)
+    {
+        fprintf(stderr, "SPLRBackwardContext: diagonal preconditioner not set up\n");
+        exit(EXIT_FAILURE);
+    }
+    // Single elementwise kernel; no memcpy through d_rhs, no cuDSS, no
+    // stream synchronization, no temporary allocation. Ordering with the
+    // producer/consumer of d_r/d_z is inherited from `stream`.
+    launch_apply_diag_precond(d_inv_diag, d_r, d_z, m_Hsize, stream);
+}
+
+double SPLRBackwardContext::benchmark_diag_setup_repeated(
+    cudaStream_t stream, int repeats
+)
+{
+    if (!m_valid)
+    {
+        fprintf(stderr, "SPLRBackwardContext: invalid context\n");
+        exit(EXIT_FAILURE);
+    }
+    if (repeats < 1)
+    {
+        fprintf(stderr, "benchmark_diag_setup_repeated: repeats must be >= 1\n");
+        exit(EXIT_FAILURE);
+    }
+    std::vector<double> samples;
+    samples.reserve(repeats);
+    for (int i = 0; i < repeats; ++i)
+    {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto t0 = std::chrono::steady_clock::now();
+        const int bad_row = extract_inv_diag_validated(
+            d_Avalues, d_Acolind, d_Arowptr, d_inv_diag, m_Hsize, stream
+        );
+        const auto t1 = std::chrono::steady_clock::now();
+        if (bad_row >= 0)
+        {
+            fprintf(stderr,
+                    "SPLRBackwardContext: CSR diagonal invalid at row %d\n",
+                    bad_row);
+            exit(EXIT_FAILURE);
+        }
+        samples.push_back(
+            std::chrono::duration<double, std::micro>(t1 - t0).count()
+        );
+    }
+    std::sort(samples.begin(), samples.end());
+    m_inv_diag_ready = true;
+    return samples[samples.size() / 2]; // median, microseconds
 }
 
 // Debug/benchmark-only (Stage 3C-2A). Identical math and execution order to

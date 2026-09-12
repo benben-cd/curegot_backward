@@ -9,6 +9,7 @@
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "solvers.h"
 #include "backward_context.h"
@@ -317,6 +318,78 @@ torch::Tensor ctx_apply_preconditioner(SPLRBackwardContext& ctx, torch::Tensor r
     return z;
 }
 
+// Apply the diagonal preconditioner: z = D_A^{-1} r, where D_A = diag(A) of
+// the context-owned CSR (Stage 3C-3). Fully asynchronous on the PyTorch
+// current stream -- unlike apply_preconditioner(), this performs no cuDSS
+// call, no memcpy and no stream synchronization; ordering with the
+// producer/consumer of r/z comes from the current stream itself.
+torch::Tensor ctx_apply_diagonal_preconditioner(
+    SPLRBackwardContext& ctx, torch::Tensor r
+)
+{
+    if (!ctx.is_valid())
+    {
+        throw std::runtime_error("SPLRBackwardContext: invalid context");
+    }
+    if (!ctx.has_diagonal_preconditioner())
+    {
+        throw std::runtime_error(
+            "SPLRBackwardContext: diagonal preconditioner not set up"
+        );
+    }
+    if (r.dim() != 1 || r.size(0) != ctx.problem_size())
+    {
+        throw std::runtime_error("SPLRBackwardContext: r must be a 1D tensor of length n + m - 1");
+    }
+    if (!r.is_cuda())
+    {
+        throw std::runtime_error("SPLRBackwardContext: r must be a CUDA tensor");
+    }
+
+    auto options = torch::TensorOptions().dtype(torch::kFloat64).device(r.device());
+    r = r.to(options).contiguous();
+
+    const at::cuda::CUDAGuard device_guard(r.device());
+    torch::Tensor z = torch::empty(ctx.problem_size(), options);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    ctx.apply_diagonal_preconditioner(
+        r.data_ptr<double>(), z.data_ptr<double>(), stream
+    );
+    return z;
+}
+
+// Debug/validation-only (Stage 3C-3): copy of D_A^{-1} for the elementwise
+// consistency check against the Python benchmark callback.
+torch::Tensor ctx_inv_diag(SPLRBackwardContext& ctx)
+{
+    if (!ctx.has_diagonal_preconditioner())
+    {
+        throw std::runtime_error(
+            "SPLRBackwardContext: diagonal preconditioner not set up"
+        );
+    }
+    auto options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCUDA);
+    torch::Tensor out = torch::empty({ctx.problem_size()}, options);
+    // The extraction kernel completed before the forward call returned
+    // (setup ends with a stream synchronization), so this synchronous copy
+    // observes the final values.
+    cudaMemcpy(out.data_ptr<double>(), ctx.inv_diag(),
+               ctx.problem_size() * sizeof(double), cudaMemcpyDeviceToDevice);
+    return out;
+}
+
+// Debug/benchmark-only (Stage 3C-3): median microseconds of the one-time
+// validated diagonal extraction (kernel + device->host check).
+double ctx_benchmark_diag_setup(SPLRBackwardContext& ctx, int repeats)
+{
+    if (!ctx.is_valid())
+    {
+        throw std::runtime_error("SPLRBackwardContext: invalid context");
+    }
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    return ctx.benchmark_diag_setup_repeated(stream, repeats);
+}
+
 // Debug/benchmark-only (Stage 3C-2A): profiled variant of
 // apply_preconditioner. Same math and execution order; returns the output
 // tensor plus a host/GPU timing breakdown. The production
@@ -583,6 +656,20 @@ void register_backward_context(py::module_& m)
         "preconditioner for the backward PCG.")
         .def("apply_preconditioner", &ctx_apply_preconditioner, py::arg("r"),
             "Compute z = B^{-1} r. r must be a 1D float64 CUDA tensor of length n + m - 1.")
+        // Native diagonal preconditioner (Stage 3C-3). Asynchronous on the
+        // PyTorch current stream; no cuDSS / memcpy / sync inside.
+        .def("apply_diagonal_preconditioner", &ctx_apply_diagonal_preconditioner,
+            py::arg("r"),
+            "Compute z = D_A^{-1} r with D_A = diag(A) of the context CSR. "
+            "Asynchronous on the PyTorch current stream.")
+        .def_property_readonly("has_diagonal_preconditioner",
+            &SPLRBackwardContext::has_diagonal_preconditioner)
+        .def("inv_diag", &ctx_inv_diag,
+            "Debug/validation-only: copy of the extracted D_A^{-1} vector.")
+        .def("benchmark_diag_setup", &ctx_benchmark_diag_setup,
+            py::arg("repeats"),
+            "Debug/benchmark-only: median microseconds of the one-time "
+            "validated diagonal extraction (kernel + device->host check).")
         // Debug/benchmark-only profiling APIs (Stage 3C-2A)
         .def("profile_preconditioner", &ctx_profile_preconditioner, py::arg("r"),
             "Debug/benchmark-only: profiled variant of apply_preconditioner. "
@@ -784,6 +871,16 @@ py::dict torch_sinkhorn_splr_bwd(
             "objective value); no backward context available"
         );
     }
+
+    // Stage 3C-3: one-time diagonal preconditioner setup. The context CSR is
+    // final at this point on every path (adopt / snapshot / fallback all
+    // converge here), and all forward GPU work has host-completed (the
+    // handoff paths end with synchronizing memcpys), so the extraction is
+    // correctly ordered on the current stream. Fatal only on a structural
+    // bug (missing / non-positive / non-finite diagonal).
+    ctx.setup_diagonal_preconditioner(
+        at::cuda::getCurrentCUDAStream()
+    );
 
     // Convert P and dual when necessary using the input tensor options
     P = P.to(src_options);

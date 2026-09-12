@@ -203,6 +203,52 @@ public:
         const double* d_r, double* d_z, int repeats
     );
 
+    // -------- Native diagonal preconditioner (Stage 3C-3) ----------------
+    // M_D^{-1} r = D_A^{-1} r, where D_A = diag(A) of the SAME stored-scale
+    // sparsified matrix A whose factorization this context owns. This is
+    // exactly the definition validated by the Stage 3C-2C/3C-2D benchmarks
+    // (the Python callback extracted the diagonal of the exported CSR); the
+    // exact-Q (unshifted) diagonal is intentionally NOT used here.
+    //
+    // Lifecycle: d_inv_diag is allocated once in the constructor (always
+    // context-owned, like h_pinned -- never adopted, never aliased) and
+    // filled once by setup_diagonal_preconditioner() after the CSR is
+    // finalized (adopt / snapshot / fallback all converge before this is
+    // called). setup is idempotent; the PCG apply path below performs no
+    // extraction, no allocation and no synchronization.
+
+    // Extract D_A^{-1} from the owned CSR (d_Avalues/d_Acolind/d_Arowptr)
+    // into d_inv_diag. One thread per row scans for col == row; every row
+    // must have exactly one diagonal entry with a positive, finite value
+    // (guaranteed by construction: sparsification keeps the diagonal and
+    // the shift makes it positive; a violation here is a bug and fatal).
+    // Synchronizes `stream` once to validate the result. One-time cost.
+    void setup_diagonal_preconditioner(cudaStream_t stream);
+
+    // z = D_A^{-1} r: single elementwise kernel on `stream`.
+    // Fully asynchronous: no cudaMemcpy through d_rhs, no cuDSS, no stream
+    // synchronization, no temporary allocation. Unlike
+    // apply_preconditioner() (which synchronizes the solver stream
+    // internally), this call returns after kernel launch; ordering with
+    // the producer/consumer of d_r/d_z is inherited from `stream`, which
+    // must therefore be the stream on which r was produced and z will be
+    // consumed (the pybind wrapper passes the PyTorch current stream).
+    void apply_diagonal_preconditioner(
+        const double* d_r, double* d_z, cudaStream_t stream
+    ) const;
+
+    bool          has_diagonal_preconditioner() const { return m_inv_diag_ready; }
+    // Debug/validation-only raw view (nullptr until setup). Not an alias of
+    // d_rhs/d_sol; owned by this context.
+    const double* inv_diag() const { return d_inv_diag; }
+
+    // Debug/benchmark-only (Stage 3C-3): re-run the full validated
+    // extraction `repeats` times and return the median host wall time in
+    // microseconds (kernel + device->host validation check, synchronizing).
+    // The one-time cudaMalloc of d_inv_diag happens in the constructor and
+    // is NOT included (it is part of context creation).
+    double benchmark_diag_setup_repeated(cudaStream_t stream, int repeats);
+
     // -------- Debug/benchmark-only base-solve profiling (Stage 3C-2B) -----
     // Pure A^{-1} r path: identical to apply_preconditioner() WITHOUT the
     // low-rank Woodbury correction, i.e.
@@ -316,6 +362,14 @@ private:
 
     // Validation: the point associated with the snapshot
     double* d_ctx_point = nullptr;
+
+    // Diagonal preconditioner (Stage 3C-3): D_A^{-1} of the owned CSR.
+    // Always context-owned (allocated in the constructor, freed by
+    // release_buffers, stolen by the move operations); never adopted, never
+    // an alias of d_rhs/d_sol. Filled once by
+    // setup_diagonal_preconditioner().
+    double* d_inv_diag = nullptr;
+    bool    m_inv_diag_ready = false;
 
     // Pinned host workspace for the reduction kernels
     double* h_pinned = nullptr;
