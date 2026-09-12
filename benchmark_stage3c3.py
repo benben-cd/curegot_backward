@@ -36,9 +36,8 @@ import statistics
 
 import torch
 
-from stage3b_validate import (
-    make_problem,
-    dense_Q,
+from stage3b_validate import make_problem, dense_Q
+from backward_core import (
     q_matvec,
     rhs_Q_scale,
     assemble_grad,

@@ -32,8 +32,8 @@ import time
 import torch
 
 # Reuse the verified Stage-3B matrix-free oracle. Do not reimplement.
-from stage3b_validate import (
-    make_problem,
+from stage3b_validate import make_problem
+from backward_core import (
     q_matvec,
     rhs_Q_scale,
     assemble_grad,
