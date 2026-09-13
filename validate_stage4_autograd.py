@@ -346,7 +346,7 @@ def test_finite_difference():
     g_vec = torch.tensor([grad[i, j] for i, j in entries],
                          dtype=torch.float64)
     best = None
-    for eps in (1e-3, 3e-4, 1e-4, 3e-5):
+    for eps in (1e-4, 3e-5, 1e-5, 3e-6):
         for k, (i, j) in enumerate(entries):
             Mp = M.clone(); Mp[i, j] += eps
             Mm = M.clone(); Mm[i, j] -= eps
@@ -390,11 +390,19 @@ def test_gradcheck_best_effort():
 
 def test_training_loop():
     n, m = 10, 12
+    # Harness-only stability (Stage 5 pass): fixed seed for the target
+    # perturbation, and the production-default forward budget (1000) for
+    # both target construction and training iterations -- a training
+    # iterate at MAX_ITER=200 could hit the forward cap. Production
+    # defaults/policy unchanged.
+    TRAIN_MAX_ITER = 1000
     M0, a, b = make_problem(n, m, ETA, 12, DEVICE)
-    M_target = M0 + 0.3 * torch.randn((n, m), dtype=torch.float64,
-                                      device=DEVICE)
+    gen = torch.Generator(device="cpu").manual_seed(120)
+    M_target = M0 + 0.3 * torch.randn((n, m), generator=gen,
+                                      dtype=torch.float64).to(DEVICE)
     T_target = splr_ot_with_info(M_target, a, b, eta=ETA, tol=TOL,
-                                 max_iter=MAX_ITER, density=0.10)["plan"]
+                                 max_iter=TRAIN_MAX_ITER,
+                                 density=0.10)["plan"]
     M_param = torch.nn.Parameter(M0.clone())
     # lr=0.1 oscillates on this landscape (verified); 0.03 converges
     # smoothly within the 20-50 step budget (section 20).
@@ -402,8 +410,8 @@ def test_training_loop():
     losses = []
     for step in range(40):
         opt.zero_grad()
-        T = splr_ot(M_param, a, b, eta=ETA, tol=TOL, max_iter=MAX_ITER,
-                    density=0.10)
+        T = splr_ot(M_param, a, b, eta=ETA, tol=TOL,
+                    max_iter=TRAIN_MAX_ITER, density=0.10)
         loss = ((T - T_target) ** 2).mean()
         loss.backward()
         assert bool(torch.isfinite(loss))
