@@ -4,3 +4,9 @@ cccl*
 *.0
 *.so
 *.pyc
+*.o
+*.csv
+*:Zone.Identifier
+build.log
+__pycache__/
+*.pyc
