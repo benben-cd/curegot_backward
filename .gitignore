@@ -10,3 +10,6 @@ cccl*
 build.log
 __pycache__/
 *.pyc
+build/
+dist/
+*.egg-info/
