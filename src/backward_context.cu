@@ -565,4 +565,3 @@ void SPLRBackwardContext::apply_diagonal_preconditioner(
     // producer/consumer of d_r/d_z is inherited from `stream`.
     launch_apply_diag_precond(d_inv_diag, d_r, d_z, m_Hsize, stream);
 }
-
