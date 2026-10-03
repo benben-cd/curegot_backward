@@ -22,6 +22,15 @@ py::dict torch_sinkhorn_splr(
     const py::kwargs& kwargs
 );
 
+py::dict torch_sinkhorn_splr_bwd(
+    torch::Tensor M, torch::Tensor a, torch::Tensor b,
+    double reg, double tol, int max_iter, int verbose,
+    const py::kwargs& kwargs
+);
+
+// Register the SPLRBackwardContext class (defined in solvers_torch.cpp)
+void register_backward_context(py::module_& m);
+
 #else
 
 // Main solvers
@@ -88,6 +97,15 @@ PYBIND11_MODULE(MODULE_NAME, m)
         py::arg("M"), py::arg("a"), py::arg("b"), py::arg("reg"),
         py::arg("tol") = 1e-6, py::arg("max_iter") = 1000, py::arg("verbose") = 0,
         "Sinkhorn SPLR algorithm (CUDA implementation with PyTorch interface)");
+
+    // Backward context class and the backward-capable solver
+    register_backward_context(m_torch);
+
+    m_torch.def("sinkhorn_splr_bwd", &torch_sinkhorn_splr_bwd,
+        py::arg("M"), py::arg("a"), py::arg("b"), py::arg("reg"),
+        py::arg("tol") = 1e-6, py::arg("max_iter") = 1000, py::arg("verbose") = 0,
+        "Sinkhorn SPLR algorithm with backward context export "
+        "(CUDA implementation with PyTorch interface)");
 
 #else
 
