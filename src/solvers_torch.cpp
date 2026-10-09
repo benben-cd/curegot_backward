@@ -313,7 +313,9 @@ torch::Tensor ctx_apply_preconditioner(SPLRBackwardContext& ctx, torch::Tensor r
 
     const at::cuda::CUDAGuard device_guard(r.device());
     torch::Tensor z = torch::empty(ctx.problem_size(), options);
-    ctx.apply_preconditioner(r.data_ptr<double>(), z.data_ptr<double>());
+    ctx.apply_preconditioner(
+        r.data_ptr<double>(), z.data_ptr<double>(), at::cuda::getCurrentCUDAStream()
+    );
     return z;
 }
 
@@ -455,6 +457,13 @@ py::dict torch_sinkhorn_splr_bwd(
 
     int n = M.size(0);
     int m = M.size(1);
+
+    // Top-K sparsifies n * (m - 1) entries; an empty domain is unsupported.
+    // Validate here before allocations/kernels, including direct native calls.
+    if (n < 1 || m < 2)
+    {
+        throw py::value_error("SPLR requires M.shape = (n, m) with n >= 1 and m >= 2");
+    }
 
     if (a.size(0) != n || b.size(0) != m)
     {

@@ -180,6 +180,7 @@ software useful in your research and applications.
 
 The single-input API differentiates a converged transport plan with respect
  to its cost matrix. Inputs must be CUDA float64 tensors on the same device.
+The cost matrix must have shape `(n, m)` with `n >= 1` and `m >= 2`.
 
 ```python
 M.requires_grad_(True)

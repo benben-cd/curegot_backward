@@ -452,7 +452,9 @@ void SPLRBackwardContext::adopt_forward_state(
     m_valid = true;
 }
 
-void SPLRBackwardContext::apply_preconditioner(const double* d_r, double* d_z)
+void SPLRBackwardContext::apply_preconditioner(
+    const double* d_r, double* d_z, cudaStream_t caller_stream
+)
 {
     if (!m_valid || !m_solver)
     {
@@ -462,12 +464,14 @@ void SPLRBackwardContext::apply_preconditioner(const double* d_r, double* d_z)
 
     cudaStream_t stream = m_solver->get_cuda_stream();
 
-    // Copy r into the persistent rhs buffer. The synchronous memcpy is
-    // ordered after prior work on the legacy default stream (e.g. the torch
-    // operations that produced r), and the cuDSS solve below is issued after
-    // the copy has completed.
-    CUDA_CHECK(cudaMemcpy(
-        d_rhs, d_r, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
+    // The RHS may have been produced on a nonblocking PyTorch stream.
+    // Order the solver stream after all caller work, including conversions.
+    cudaEvent_t rhs_ready;
+    CUDA_CHECK(cudaEventCreateWithFlags(&rhs_ready, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(rhs_ready, caller_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(stream, rhs_ready, 0));
+    CUDA_CHECK(cudaMemcpyAsync(
+        d_rhs, d_r, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice, stream
     ));
 
     // Cholesky solve: d_sol = A^{-1} r
@@ -486,10 +490,14 @@ void SPLRBackwardContext::apply_preconditioner(const double* d_r, double* d_z)
         );
     }
 
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaMemcpy(
-        d_z, d_sol, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice
+    CUDA_CHECK(cudaMemcpyAsync(
+        d_z, d_sol, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice, stream
     ));
+    // Preserve the synchronous apply contract. Copy-back is complete before
+    // returning to any caller stream, and temporary r/z tensors cannot be
+    // released while cuDSS uses them. No device-wide synchronization is needed.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaEventDestroy(rhs_ready));
 }
 
 // ---------------------------------------------------------------------------

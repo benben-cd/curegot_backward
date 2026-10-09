@@ -33,6 +33,61 @@ def dense(T,G,eta):
     return Q,mu,lam,grad
 
 
+def test_nondefault_stream():
+    M,a,b=problem()
+    out=curegot.torch.sinkhorn_splr_bwd(M,a,b,.3,1e-8,1000,0,density=.5)
+    assert out['converged']
+    ctx=out['context']
+    r=torch.zeros(ctx.dim,device=M.device,dtype=M.dtype)
+    reference=ctx.apply_preconditioner(torch.ones_like(r))
+    torch.cuda.synchronize()
+    stream=torch.cuda.Stream(device=M.device)
+    # Warm the caller-stream allocation cache before delaying the RHS write.
+    with torch.cuda.stream(stream):
+        warm=ctx.apply_preconditioner(r)
+    stream.synchronize();del warm
+    for value in (1.,2.,3.):
+        r.zero_();torch.cuda.synchronize()
+        with torch.cuda.stream(stream):
+            # Without a caller->solver dependency the solver reads old zeros.
+            torch.cuda._sleep(300000000)
+            r.fill_(value)
+            z=ctx.apply_preconditioner(r)
+            observed=z.clone()  # Consumer must see the completed copy-back.
+        stream.synchronize()
+        error=relative(observed,value*reference)
+        assert error<1e-12, f'non-default stream relative error={error}'
+    print(f'PASS non-default stream / repeated apply: relative error={error:.3e}',flush=True)
+
+
+def test_supported_sizes():
+    for n,m in ((4,1),(1,1),(0,4),(4,0)):
+        M=torch.ones(n,m,device='cuda',dtype=torch.float64)
+        a=torch.full((n,),1/max(n,1),device=M.device,dtype=M.dtype)
+        b=torch.full((m,),1/max(m,1),device=M.device,dtype=M.dtype)
+        # Shared native guard also protects SPLROTFunction.apply and the module.
+        for call in (
+            lambda: curegot.torch.splr_ot(M,a,b,eta=.3),
+            lambda: curegot.torch.SPLROT(.3)(M,a,b),
+            lambda: curegot.torch.sinkhorn_splr_bwd(M,a,b,.3),
+            lambda: curegot.autograd.SPLROTFunction.apply(
+                M,a,b,.3,1e-6,1000,None,3,'diag',1e-12,2000),
+        ):
+            try:call()
+            except ValueError as error:
+                assert 'n >= 1' in str(error) and 'm >= 2' in str(error)
+            else:raise AssertionError(f'unsupported shape {(n,m)} must be rejected')
+    # A single row is supported, including the smallest admissible matrix.
+    M=torch.tensor([[.1,.3]],device='cuda',dtype=torch.float64,requires_grad=True)
+    a=torch.ones(1,device=M.device,dtype=M.dtype)
+    b=torch.full((2,),.5,device=M.device,dtype=M.dtype)
+    T=curegot.torch.splr_ot(M,a,b,eta=.3,tol=1e-8)
+    assert torch.allclose(T,b[None,:],rtol=0,atol=1e-8)
+    T.square().sum().backward()
+    assert torch.isfinite(M.grad).all() and M.grad.abs().max()<1e-8
+    print('PASS unsupported sizes rejected / supported (1,2) backward',flush=True)
+
+
 def run():
     assert torch.cuda.is_available()
     # Forward 1e-8 avoids testing the known near-machine-precision stall.
@@ -157,6 +212,8 @@ def run():
     rhs=torch.randn(dim,generator=torch.Generator().manual_seed(5),dtype=torch.float64).cuda()
     assert relative(rc.apply_preconditioner(rhs),torch.linalg.solve(B,rhs))<1e-8
     print('PASS rank-2 active dense oracle / preconditioner B inverse',flush=True)
+    test_nondefault_stream()
+    test_supported_sizes()
     print('BACKWARD CORE VALIDATION PASS',flush=True)
 
 

@@ -104,8 +104,11 @@ public:
     // ---------------- Backward-side interface ----------------
 
     // Compute z = B^{-1} r. d_r and d_z are device pointers of length
-    // problem_size. Synchronous with respect to the host.
-    void apply_preconditioner(const double* d_r, double* d_z);
+    // problem_size. Waits for caller_stream and returns after copy-back
+    // completes, so caller tensors and context scratch remain safe to reuse.
+    void apply_preconditioner(
+        const double* d_r, double* d_z, cudaStream_t caller_stream
+    );
 
     // -------- Native diagonal preconditioner () ----------------
     // M_D^{-1} r = D_A^{-1} r, where D_A = diag(A) of the SAME stored-scale

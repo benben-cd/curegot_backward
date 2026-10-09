@@ -18,7 +18,7 @@ Gradient scope (deliberately conservative):
     eta:  constant scalar -- tensor requires_grad=True raises NotImplementedError
 
 Requirements: M/a/b are CUDA float64 tensors on the same device; one OT
-problem [n, m] per call.
+problem [n, m] per call, with n >= 1 and m >= 2.
 AMP / autocast is unsupported and raises. Double backward is unsupported
 (@once_differentiable raises on the second differentiation).
 
