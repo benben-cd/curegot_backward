@@ -6,41 +6,12 @@ not diag(Q(T)). SPLR reuses its factorization and optional rank-2 update;
 none selects plain CG. Performance depends on workload and tolerance.
 """
 
-import torch
+from ._internal_torch import torch as _native_torch
+from ._backward_core import rhs_Q_scale, assemble_grad
 
-from ._backward_core import (
-    q_matvec,
-    rhs_Q_scale,
-    assemble_grad,
-    pcg,
-)
-
-__all__ = ["solve_backward", "select_preconditioner"]
+__all__ = ["solve_backward"]
 
 _VALID_PRECONDITIONERS = ("diag", "splr", "none")
-
-
-def select_preconditioner(ctx, preconditioner):
-    """Map a preconditioner mode string to the apply callable (or None).
-
-    Production semantics: "diag" is the NATIVE diagonal. Raises ValueError
-    on any other value.
-    """
-    if preconditioner == "diag":
-        if not bool(ctx.has_diagonal_preconditioner):
-            raise RuntimeError(
-                "SPLRBackwardContext: diagonal preconditioner not set up "
-                "(context predates Stage 3C-3 or setup failed)"
-            )
-        return ctx.apply_diagonal_preconditioner
-    if preconditioner == "splr":
-        return ctx.apply_preconditioner
-    if preconditioner == "none":
-        return None
-    raise ValueError(
-        f"invalid preconditioner '{preconditioner}'; "
-        f"expected one of: {' | '.join(_VALID_PRECONDITIONERS)}"
-    )
 
 
 def solve_backward(
@@ -50,21 +21,20 @@ def solve_backward(
     eta,
     *,
     preconditioner="diag",
-    tol=1e-12,
+    tol=1e-6,
     max_iter=2000,
 ):
     """Solve the backward pass and assemble the implicit gradient.
 
     Args:
         T:   [n, m] float64 CUDA tensor, the optimal transport plan from
-             sinkhorn_splr_bwd (out["plan"]).
+             sinkhorn_splr_save_ctx (out["plan"]).
         G:   [n, m] float64 CUDA tensor, upstream gradient dL/dT.
-        ctx: SPLRBackwardContext returned by sinkhorn_splr_bwd
+        ctx: SPLRBackwardContext returned by sinkhorn_splr_save_ctx
              (out["context"]).
         eta: entropic regularization used in the forward pass.
         preconditioner: "diag" (default) | "splr" | "none".
-        tol:     PCG relative residual tolerance (matches the validated
-                 oracle tolerance).
+        tol:     PCG relative residual tolerance (default 1e-6).
         max_iter: PCG iteration cap.
 
     Returns:
@@ -78,41 +48,27 @@ def solve_backward(
     Note: the returned "lambda" is the reduced-gauge dual (beta_m = 0);
     "grad" already accounts for the gauge internally.
     """
+    # Validate the plan/upstream shapes and preconditioner mode.
     if T.dim() != 2:
         raise ValueError("T must be a 2D tensor")
     if G.shape != T.shape:
         raise ValueError("G must have the same shape as T")
-    # Note: ctx validity is enforced natively (an invalid context can never
-    # be returned by sinkhorn_splr_bwd, and the apply entry points raise on
-    # misuse); no Python-side is_valid binding exists.
+    if preconditioner not in _VALID_PRECONDITIONERS:
+        raise ValueError(
+            f"invalid preconditioner '{preconditioner}'; "
+            f"expected one of: {' | '.join(_VALID_PRECONDITIONERS)}"
+        )
+
+    # Construct the reduced backward right-hand side.
     n, m = T.shape
-
-    precond = select_preconditioner(ctx, preconditioner)
-
     mu = rhs_Q_scale(G, T, n, m)
-    if not bool(torch.any(mu)):
-        # Degenerate upstream gradient: Q lambda = 0 has the exact solution
-        # lambda = 0 (Q is SPD). Short-circuit instead of running PCG --
-        # the iterative loop would otherwise hit its p^T A p <= 0 breakdown
-        # guard on the zero start residual. This is exact, not an
-        # approximation, and does not touch any nonzero-G path.
-        lam = torch.zeros_like(mu)
-        grad = assemble_grad(T, G, lam, eta, n, m)
-        return {
-            "lambda": lam,
-            "grad": grad,
-            "iterations": 0,
-            "converged": True,
-            "preconditioner": preconditioner,
-        }
-    matvec = lambda v: q_matvec(T, v, n, m)
-    lam, iterations, converged = pcg(matvec, precond, mu, tol=tol,
-                                     max_iter=max_iter)
-    grad = assemble_grad(T, G, lam, eta, n, m)
-    return {
-        "lambda": lam,
-        "grad": grad,
-        "iterations": iterations,
-        "converged": converged,
-        "preconditioner": preconditioner,
-    }
+
+    # Solve the true reduced system in one native C++/CUDA call.
+    result = _native_torch._solve_backward_native(
+        T, mu, ctx, preconditioner, tol, max_iter
+    )
+
+    # Assemble dL/dM from the solved dual perturbation.
+    result["grad"] = assemble_grad(T, G, result["lambda"], eta, n, m)
+    result["preconditioner"] = preconditioner
+    return result

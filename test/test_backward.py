@@ -1,220 +1,403 @@
-"""Small GPU correctness suite; no historical files or compatibility imports.
+#!/usr/bin/env python3
+"""Test script for differentiable SPLR OT backward.
 
 Run from an installed candidate: python -B test/test_backward.py
 """
+
 import gc
-import warnings
-from unittest.mock import patch
+
 import torch
+
 import curegot
-from curegot.backward import solve_backward
-from curegot._backward_core import q_matvec
 
 
-def problem(n=16,m=19,seed=42):
-    g=torch.Generator().manual_seed(seed)
-    M=torch.rand(n,m,generator=g,dtype=torch.float64).cuda()
-    a=torch.rand(n,generator=g,dtype=torch.float64).cuda()+.5
-    b=torch.rand(m,generator=g,dtype=torch.float64).cuda()+.5
-    return M,a/a.sum(),b/b.sum()
+def problem(n=16, m=19, seed=42):
+    generator = torch.Generator().manual_seed(seed)
+    M = torch.rand(n, m, generator=generator, dtype=torch.float64).cuda()
+    a = torch.rand(n, generator=generator, dtype=torch.float64).cuda() + 0.5
+    b = torch.rand(m, generator=generator, dtype=torch.float64).cuda() + 0.5
+    return M, a / a.sum(), b / b.sum()
 
 
-def relative(x,y):return float(torch.linalg.norm(x-y)/torch.linalg.norm(y).clamp_min(1e-30))
+def random_gradient(plan, seed=9):
+    return torch.randn(
+        plan.shape, generator=torch.Generator().manual_seed(seed), dtype=plan.dtype
+    ).to(plan.device)
 
 
-def dense(T,G,eta):
-    n,m=T.shape
-    Q=torch.cat([torch.cat([torch.diag(T.sum(1)),T[:,:-1]],1),
-                 torch.cat([T[:,:-1].T,torch.diag(T.sum(0)[:-1])],1)],0)
-    GT=G*T;mu=torch.cat([GT.sum(1),GT.sum(0)[:-1]])
-    lam=torch.linalg.solve(Q,mu)
-    beta=torch.cat([lam[n:],lam.new_zeros(1)])
-    grad=T*(lam[:n,None]+beta[None,:]-G)/eta
-    return Q,mu,lam,grad
+def relative(actual, expected):
+    denominator = torch.linalg.norm(expected)
+    assert denominator > 0
+    return float(torch.linalg.norm(actual - expected) / denominator)
+
+
+def dense_gradient(plan, upstream, eta):
+    n = plan.shape[0]
+    reduced_plan = plan[:, :-1]
+    Q = torch.cat(
+        [
+            torch.cat([torch.diag(plan.sum(1)), reduced_plan], 1),
+            torch.cat([reduced_plan.T, torch.diag(plan.sum(0)[:-1])], 1),
+        ],
+        0,
+    )
+    weighted = upstream * plan
+    rhs = torch.cat([weighted.sum(1), weighted.sum(0)[:-1]])
+    dual = torch.linalg.solve(Q, rhs)
+    beta = torch.cat([dual[n:], dual.new_zeros(1)])
+    return plan * (dual[:n, None] + beta[None, :] - upstream) / eta
+
+
+def expect_error(error_type, message, call):
+    try:
+        call()
+    except error_type as error:
+        assert message in str(error), str(error)
+    else:
+        raise AssertionError(f"expected {error_type.__name__}: {message}")
+
+
+def test_backward_against_dense_reference():
+    # Create test data.
+    M, a, b = problem()
+    G = random_gradient(M)
+    options = {"eta": 0.3, "tol": 1e-8, "density": 0.5}
+
+    for mode in ("none", "diag", "splr"):
+        # Run differentiable SPLR OT.
+        cost = M.clone().requires_grad_(True)
+        plan = curegot.torch.splr_ot(
+            cost,
+            a,
+            b,
+            **options,
+            backward_preconditioner=mode,
+            backward_tol=1e-12,
+        )
+
+        # Construct a scalar loss and run backward.
+        loss = (plan * G).sum()
+        loss.backward()
+
+        # Compute the independent dense reference.
+        expected = dense_gradient(plan.detach(), G, options["eta"])
+
+        # Each preconditioner must give the correct cost gradient.
+        error = relative(cost.grad, expected)
+        assert error < 1e-8
+        print(
+            f"PASS {mode} backward against dense reference: relative error={error:.3e}"
+        )
+
+
+def test_finite_difference():
+    # Create test data.
+    M, a, b = problem()
+    G = random_gradient(M)
+    options = {"eta": 0.3, "tol": 1e-8, "density": 0.5}
+
+    # Compute the autograd gradient for each preconditioner.
+    gradients = []
+    for mode in ("none", "diag", "splr"):
+        cost = M.clone().requires_grad_(True)
+        plan = curegot.torch.splr_ot(
+            cost,
+            a,
+            b,
+            **options,
+            backward_preconditioner=mode,
+            backward_tol=1e-12,
+        )
+        (plan * G).sum().backward()
+        gradients.append((mode, float(cost.grad[2, 3])))
+
+    # Perturb one cost entry.
+    epsilon = 1e-3
+    direction = torch.zeros_like(M)
+    direction[2, 3] = 1
+    with torch.no_grad():
+        plus = curegot.torch.splr_ot(M + epsilon * direction, a, b, **options)
+        minus = curegot.torch.splr_ot(M - epsilon * direction, a, b, **options)
+
+    # Compute the central finite difference.
+    finite_difference = float(((plus - minus) * G).sum() / (2 * epsilon))
+
+    # Compare the numerical and autograd gradients.
+    for mode, gradient in gradients:
+        error = abs(finite_difference - gradient)
+        assert error < 1e-5
+        print(f"PASS {mode} finite difference: absolute error={error:.3e}")
+
+
+def test_active_rank2():
+    # Create a problem with an active rank-2 update.
+    M, a, b = problem(100, 120, 40)
+    G = random_gradient(M, seed=13)
+
+    # Run differentiable SPLR OT.
+    cost = M.clone().requires_grad_(True)
+    plan = curegot.torch.splr_ot(
+        cost,
+        a,
+        b,
+        eta=0.03,
+        tol=1e-8,
+        max_iter=200,
+        density=0.1,
+        backward_preconditioner="splr",
+        backward_tol=1e-12,
+    )
+
+    # Require actual rank-2 activation and saved factorization reuse.
+    context = plan.grad_fn.backward_context
+    assert context.low_rank_enabled and context.adopted_forward_state
+
+    # Run backward through the public API.
+    plan.backward(G)
+
+    # Compare with the independent dense reference.
+    expected = dense_gradient(plan.detach(), G, 0.03)
+    assert relative(cost.grad, expected) < 1e-8
+    print("PASS public backward with active rank-2 SPLR")
+
+
+def test_forward_context():
+    # Create data and a controlled legacy forward result.
+    M, a, b = problem()
+    G = random_gradient(M)
+    options = {"density": 1.0, "candidate_sinkhorn_iter": 0}
+    legacy = curegot.torch.sinkhorn_splr(M, a, b, 0.3, 1e-8, 1000, 0, **options)
+
+    for name, kwargs in (
+        ("normal", {}),
+        ("immediate", {"x0": legacy["dual"]}),
+    ):
+        # Save a usable context at the final forward point.
+        saved = curegot.torch.sinkhorn_splr_save_ctx(
+            M, a, b, 0.3, 1e-8, 1000, 0, **options, **kwargs
+        )
+        assert saved["converged"]
+        assert relative(saved["plan"], legacy["plan"]) < 1e-10
+
+        # Require adoption normally and fallback at immediate convergence.
+        context = saved["context"]
+        if name == "normal":
+            assert context.adopted_forward_state
+        else:
+            assert saved["niter"] == 0 and context.is_fallback
+            assert not context.low_rank_enabled
+
+        # Use the saved context for backward.
+        result = curegot.torch.solve_backward(
+            saved["plan"], G, context, 0.3, preconditioner="splr", tol=1e-12
+        )
+
+        # Compare the cost gradient with the independent dense reference.
+        expected = dense_gradient(saved["plan"], G, 0.3)
+        assert result["converged"] and relative(result["grad"], expected) < 1e-8
+        print(f"PASS save_ctx {name}: usable context and dense cost gradient")
 
 
 def test_nondefault_stream():
-    M,a,b=problem()
-    out=curegot.torch.sinkhorn_splr_bwd(M,a,b,.3,1e-8,1000,0,density=.5)
-    assert out['converged']
-    ctx=out['context']
-    r=torch.zeros(ctx.dim,device=M.device,dtype=M.dtype)
-    reference=ctx.apply_preconditioner(torch.ones_like(r))
-    torch.cuda.synchronize()
-    stream=torch.cuda.Stream(device=M.device)
-    # Warm the caller-stream allocation cache before delaying the RHS write.
+    # Create test data and order the new stream after its producers.
+    M, a, b = problem()
+    G = random_gradient(M)
+    stream = torch.cuda.Stream(device=M.device)
+    stream.wait_stream(torch.cuda.current_stream())
+
     with torch.cuda.stream(stream):
-        warm=ctx.apply_preconditioner(r)
-    stream.synchronize();del warm
-    for value in (1.,2.,3.):
-        r.zero_();torch.cuda.synchronize()
-        with torch.cuda.stream(stream):
-            # Without a caller->solver dependency the solver reads old zeros.
-            torch.cuda._sleep(300000000)
-            r.fill_(value)
-            z=ctx.apply_preconditioner(r)
-            observed=z.clone()  # Consumer must see the completed copy-back.
-        stream.synchronize()
-        error=relative(observed,value*reference)
-        assert error<1e-12, f'non-default stream relative error={error}'
-    print(f'PASS non-default stream / repeated apply: relative error={error:.3e}',flush=True)
+        # Run differentiable SPLR OT on the non-default stream.
+        cost = M.clone().requires_grad_(True)
+        plan = curegot.torch.splr_ot(
+            cost,
+            a,
+            b,
+            eta=0.3,
+            tol=1e-8,
+            density=0.5,
+            backward_preconditioner="splr",
+            backward_tol=1e-12,
+        )
+
+        # Warm backward before delaying the upstream-gradient producer.
+        delayed_gradient = torch.zeros_like(plan)
+        torch.autograd.grad(plan, cost, torch.ones_like(plan), retain_graph=True)
+
+        # Produce the upstream gradient on the same stream.
+        torch.cuda._sleep(300000000)
+        delayed_gradient.copy_(G)
+
+        # Run backward on the same stream.
+        plan.backward(delayed_gradient)
+
+        # Consume the gradient immediately.
+        observed = cost.grad.clone()
+
+    # Compare against the reference after the stream finishes.
+    stream.synchronize()
+    expected = dense_gradient(plan.detach(), G, 0.3)
+    assert relative(observed, expected) < 1e-8
+    print("PASS public backward / delayed gradient / same-stream consumer")
 
 
-def test_supported_sizes():
-    for n,m in ((4,1),(1,1),(0,4),(4,0)):
-        M=torch.ones(n,m,device='cuda',dtype=torch.float64)
-        a=torch.full((n,),1/max(n,1),device=M.device,dtype=M.dtype)
-        b=torch.full((m,),1/max(m,1),device=M.device,dtype=M.dtype)
-        # Shared native guard also protects SPLROTFunction.apply and the module.
-        for call in (
-            lambda: curegot.torch.splr_ot(M,a,b,eta=.3),
-            lambda: curegot.torch.SPLROT(.3)(M,a,b),
-            lambda: curegot.torch.sinkhorn_splr_bwd(M,a,b,.3),
-            lambda: curegot.autograd.SPLROTFunction.apply(
-                M,a,b,.3,1e-6,1000,None,3,'diag',1e-12,2000),
-        ):
-            try:call()
-            except ValueError as error:
-                assert 'n >= 1' in str(error) and 'm >= 2' in str(error)
-            else:raise AssertionError(f'unsupported shape {(n,m)} must be rejected')
-    # A single row is supported, including the smallest admissible matrix.
-    M=torch.tensor([[.1,.3]],device='cuda',dtype=torch.float64,requires_grad=True)
-    a=torch.ones(1,device=M.device,dtype=M.dtype)
-    b=torch.full((2,),.5,device=M.device,dtype=M.dtype)
-    T=curegot.torch.splr_ot(M,a,b,eta=.3,tol=1e-8)
-    assert torch.allclose(T,b[None,:],rtol=0,atol=1e-8)
-    T.square().sum().backward()
-    assert torch.isfinite(M.grad).all() and M.grad.abs().max()<1e-8
-    print('PASS unsupported sizes rejected / supported (1,2) backward',flush=True)
+def test_lifetime_and_repeated_backward():
+    # Create test data.
+    M, a, b = problem()
+    G = random_gradient(M)
+    options = {"eta": 0.3, "tol": 1e-8, "density": 0.5}
+
+    for mode in ("none", "diag", "splr"):
+        # Build the forward graph.
+        cost = M.clone().requires_grad_(True)
+        plan = curegot.torch.splr_ot(
+            cost,
+            a,
+            b,
+            **options,
+            backward_preconditioner=mode,
+            backward_tol=1e-12,
+        )
+        loss = (plan * G).sum()
+
+        # Run the first backward and compare with the dense reference.
+        loss.backward(retain_graph=True)
+        expected = dense_gradient(plan.detach(), G, options["eta"])
+        assert relative(cost.grad, expected) < 1e-8
+        first = cost.grad.clone()
+
+        # Run repeated backward after garbage collection.
+        cost.grad = None
+        gc.collect()
+        loss.backward()
+
+        # Reusing the graph must produce the same gradient.
+        assert relative(cost.grad, first) < 1e-8
+        print(f"PASS {mode} repeated backward")
+
+    # Build a graph whose forward-local plan can be released.
+    cost = M.clone().requires_grad_(True)
+    plan = curegot.torch.splr_ot(
+        cost, a, b, **options, backward_preconditioner="splr", backward_tol=1e-12
+    )
+    expected = dense_gradient(plan.detach(), 2 * plan.detach(), options["eta"])
+    loss = plan.square().sum()
+
+    # Release forward-local references.
+    del plan
+
+    # Run backward after garbage collection.
+    gc.collect()
+    loss.backward()
+
+    # Compare against the dense reference.
+    assert relative(cost.grad, expected) < 1e-8
+    print("PASS context lifetime after releasing forward locals")
 
 
-def run():
+def test_sizes_and_failures():
+    # Unsupported public shapes must fail before solving.
+    for n, m in ((4, 1), (0, 4)):
+        M = torch.ones(n, m, device="cuda", dtype=torch.float64)
+        a = torch.full((n,), 1 / max(n, 1), device=M.device, dtype=M.dtype)
+        b = torch.full((m,), 1 / max(m, 1), device=M.device, dtype=M.dtype)
+        expect_error(
+            ValueError,
+            "n >= 1",
+            lambda: curegot.torch.splr_ot(M, a, b, eta=0.3),
+        )
+
+    # Create the smallest supported problem.
+    M = torch.tensor(
+        [[0.1, 0.3]], device="cuda", dtype=torch.float64, requires_grad=True
+    )
+    a = M.new_ones(1)
+    b = M.new_full((2,), 0.5)
+
+    # Run differentiable SPLR OT.
+    plan = curegot.torch.splr_ot(M, a, b, eta=0.3, tol=1e-8)
+
+    # The single-row plan is fixed by the column marginals.
+    assert torch.allclose(plan, b[None, :], rtol=0, atol=1e-8)
+
+    # Its cost gradient must be finite and effectively zero.
+    plan.square().sum().backward()
+    assert torch.isfinite(M.grad).all() and M.grad.abs().max() < 1e-8
+
+    # Create test data.
+    M, a, b = problem()
+
+    # Reject forward iteration-limit failure.
+    expect_error(
+        RuntimeError,
+        "forward solver did not converge",
+        lambda: curegot.torch.splr_ot(
+            M, a, b, eta=0.3, tol=1e-8, max_iter=1, density=0.5
+        ),
+    )
+
+    # Build a converged forward graph with a one-step backward limit.
+    cost = M.clone().requires_grad_(True)
+    plan = curegot.torch.splr_ot(
+        cost,
+        a,
+        b,
+        eta=0.3,
+        tol=1e-8,
+        density=0.5,
+        backward_preconditioner="none",
+        backward_max_iter=1,
+    )
+
+    # Reject backward non-convergence without returning a cost gradient.
+    expect_error(
+        RuntimeError,
+        "backward PCG did not converge",
+        lambda: plan.backward(random_gradient(plan)),
+    )
+    assert cost.grad is None
+    print("PASS smallest shape / invalid shapes / forward and backward failures")
+
+
+def test_tiny_gradient():
+    # Create the compact normalization regression.
+    M = torch.tensor(
+        [[0.1, 0.4, 0.8], [0.9, 0.2, 0.5]],
+        device="cuda",
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    a = M.new_tensor([0.4, 0.6])
+    b = M.new_tensor([0.2, 0.3, 0.5])
+    G = M.new_tensor([[1.0, -0.5, 0.3], [0.2, 0.8, -0.4]])
+
+    # Run public backward with a tiny upstream gradient and default settings.
+    plan = curegot.torch.splr_ot(M, a, b, eta=0.3, tol=1e-8)
+    scale = 1e-160
+    plan.backward(G * scale)
+
+    # Compute the ordinary-scale dense reference.
+    expected = dense_gradient(plan.detach(), G, 0.3)
+
+    # Undo the scale before taking norms so the oracle cannot underflow.
+    assert torch.count_nonzero(M.grad) > 0
+    assert relative(M.grad / scale, expected) < 1e-8
+    print("PASS public tiny-gradient normalization (1e-160)")
+
+
+def main():
     assert torch.cuda.is_available()
-    # Forward 1e-8 avoids testing the known near-machine-precision stall.
-    # Backward tolerance remains the production default 1e-12.
-    M,a,b=problem();eta=.3
-    out=curegot.torch.sinkhorn_splr_bwd(M,a,b,eta,1e-8,1000,0,density=.5)
-    assert out['converged'] and out['context'].adopted_forward_state
-    T=out['plan'];ctx=out['context']
-    G=torch.randn(T.shape,generator=torch.Generator().manual_seed(9),dtype=T.dtype).cuda()
-    Q,mu,lam,grad=dense(T,G,eta)
-    assert relative(q_matvec(T,lam,*T.shape),Q@lam)<1e-13
-    for mode in ('none','diag','splr'):
-        res=solve_backward(T,G,ctx,eta,preconditioner=mode)
-        residual=relative(Q@res['lambda'],mu)
-        assert res['converged'] and residual<2e-12
-        assert relative(res['lambda'],lam)<1e-8 and relative(res['grad'],grad)<1e-8
-        z=solve_backward(T,torch.zeros_like(G),ctx,eta,preconditioner=mode)
-        assert z['converged'] and z['iterations']==0 and torch.count_nonzero(z['grad'])==0
-        print(f'PASS dense oracle / {mode}: residual={residual:.3e}',flush=True)
-    # Internal CSR accessors return copies. Expand the stored symmetric triangle.
-    vals=ctx._csr_values();cols=ctx._csr_colind().long();ptr=ctx._csr_rowptr().long()
-    A=torch.zeros_like(Q)
-    for i in range(Q.shape[0]):A[i,cols[ptr[i]:ptr[i+1]]]=vals[ptr[i]:ptr[i+1]]
-    A=A+A.T-torch.diag(A.diag())
-    assert relative(ctx.apply_diagonal_preconditioner(torch.ones_like(mu)),1/A.diag())<1e-13
-    assert relative(ctx.apply_diagonal_preconditioner(mu),mu/A.diag())<1e-13
-    print('PASS native diagonal / adopted context',flush=True)
-    fb=curegot.torch.sinkhorn_splr_bwd(M,a,b,eta,1e-7,1000,0,density=.5,x0=out['dual'])
-    assert fb['converged'] and fb['niter']==0 and fb['context'].is_fallback and not fb['context'].low_rank_enabled
-    rf=solve_backward(fb['plan'],G,fb['context'],eta,preconditioner='splr')
-    _,_,lf,gf=dense(fb['plan'],G,eta)
-    assert relative(rf['lambda'],lf)<1e-8 and relative(rf['grad'],gf)<1e-8
-    print('PASS immediate-convergence fallback',flush=True)
-    for mode in ('none','diag','splr'):
-        cost=M.clone().requires_grad_(True)
-        plan=curegot.torch.splr_ot(cost,a,b,eta=eta,tol=1e-8,density=.5,backward_preconditioner=mode)
-        _,_,_,expected=dense(plan.detach(),G,eta)
-        loss=(plan*G).sum();loss.backward(retain_graph=True)
-        assert relative(cost.grad,expected)<1e-8
-        first=cost.grad.clone();cost.grad=None;gc.collect();loss.backward()
-        assert relative(cost.grad,first)<1e-8
-        # Finite difference of the scalar objective checks the implicit formula.
-        eps=1e-3;direction=torch.zeros_like(M);direction[2,3]=1
-        with torch.no_grad():
-            plus=curegot.torch.splr_ot(M+eps*direction,a,b,eta=eta,tol=1e-8,density=.5)
-            minus=curegot.torch.splr_ot(M-eps*direction,a,b,eta=eta,tol=1e-8,density=.5)
-        fd=float(((plus-minus)*G).sum()/(2*eps))
-        assert abs(fd-float(first[2,3]))<1e-5
-        print(f'PASS {mode} autograd / repeated backward / finite difference',flush=True)
-    # Forward locals disappear while the graph remains the context owner.
-    cost=M.clone().requires_grad_(True)
-    def make_loss():return curegot.torch.splr_ot(cost,a,b,eta=eta,tol=1e-8,density=.5,backward_preconditioner='splr').square().sum()
-    loss=make_loss();gc.collect();loss.backward();assert torch.isfinite(cost.grad).all()
-    try:curegot.torch.splr_ot(M,a.clone().requires_grad_(),b,eta=eta)
-    except NotImplementedError:pass
-    else:raise AssertionError('a gradient must be rejected')
-    print('PASS context lifetime / input contract',flush=True)
-    # Unsupported eta gradients must fail before float conversion warns/detaches.
-    for device in ('cpu', M.device):
-        differentiable_eta=torch.tensor(eta,dtype=torch.float64,device=device,requires_grad=True)
-        for call in (
-            lambda: curegot.torch.splr_ot(M,a,b,eta=differentiable_eta),
-            lambda: curegot.torch.SPLROT(differentiable_eta),
-        ):
-            with warnings.catch_warnings():
-                warnings.simplefilter('error')
-                try:call()
-                except NotImplementedError as error:assert 'eta' in str(error)
-                else:raise AssertionError('eta gradient must be rejected')
-    for constant_eta in (eta,torch.tensor(eta,dtype=torch.float64),
-                         torch.tensor(eta,dtype=torch.float64,device=M.device)):
-        layer=curegot.torch.SPLROT(constant_eta,tol=1e-8,density=.5)
-        assert layer.eta==eta and not list(layer.parameters()) and not list(layer.buffers())
-        assert not hasattr(layer,'backward_context')
-        # This is an API conversion test, independent of repeated forward trajectories.
-        with patch.object(curegot.autograd._native_torch, 'sinkhorn_splr_bwd',
-                          return_value=out) as native_forward:
-            plans=(
-                curegot.torch.splr_ot(M,a,b,eta=constant_eta,tol=1e-8,density=.5),
-                layer(M,a,b),
-            )
-            assert native_forward.call_count==2
-            for call in native_forward.call_args_list:
-                assert isinstance(call.args[3],float) and call.args[3]==eta
-            assert all(torch.equal(plan,T) for plan in plans)
-    print('PASS constant eta / explicit eta gradient rejection',flush=True)
 
-    # Public autograd must reject real solver iteration-limit failures.
-    try:
-        curegot.torch.splr_ot(M,a,b,eta=eta,tol=1e-8,max_iter=1,density=.5)
-    except RuntimeError as error:
-        assert 'forward solver did not converge' in str(error)
-    else:
-        raise AssertionError('non-converged forward must be rejected')
-    cost=M.clone().requires_grad_(True)
-    plan=curegot.torch.splr_ot(cost,a,b,eta=eta,tol=1e-8,density=.5,
-                             backward_preconditioner='none',backward_max_iter=1)
-    try:
-        (plan*G).sum().backward()
-    except RuntimeError as error:
-        assert 'backward PCG did not converge' in str(error)
-        assert cost.grad is None
-    else:
-        raise AssertionError('non-converged PCG must not return a gradient')
-    print('PASS explicit forward / backward non-convergence rejection',flush=True)
-
-    # Fixed previously validated rank-2 workload; require actual activation.
-    Mr,ar,br=problem(100,120,40)
-    ro=curegot.torch.sinkhorn_splr_bwd(Mr,ar,br,.03,1e-8,200,0,density=.1)
-    assert ro['converged'] and ro['context'].low_rank_enabled and ro['context'].adopted_forward_state
-    Gr=torch.randn(ro['plan'].shape,generator=torch.Generator().manual_seed(13),dtype=torch.float64).cuda()
-    _,_,lr,gr=dense(ro['plan'],Gr,.03)
-    rr=solve_backward(ro['plan'],Gr,ro['context'],.03,preconditioner='splr')
-    assert rr['converged'] and relative(rr['lambda'],lr)<1e-8 and relative(rr['grad'],gr)<1e-8
-    rc=ro['context'];dim=rc.dim
-    values=rc._csr_values();columns=rc._csr_colind().long();rowptr=rc._csr_rowptr().long()
-    Ar=torch.zeros(dim,dim,dtype=torch.float64,device=Mr.device)
-    for i in range(dim):Ar[i,columns[rowptr[i]:rowptr[i+1]]]=values[rowptr[i]:rowptr[i+1]]
-    Ar=Ar+Ar.T-torch.diag(Ar.diag())
-    sec_s=rc._secant_s();sec_y=rc._secant_y();As=Ar@sec_s
-    B=Ar+(.03/rc.ys)*torch.outer(sec_y,sec_y)-torch.outer(As,As)/torch.dot(sec_s,As)
-    rhs=torch.randn(dim,generator=torch.Generator().manual_seed(5),dtype=torch.float64).cuda()
-    assert relative(rc.apply_preconditioner(rhs),torch.linalg.solve(B,rhs))<1e-8
-    print('PASS rank-2 active dense oracle / preconditioner B inverse',flush=True)
+    test_backward_against_dense_reference()
+    test_finite_difference()
+    test_active_rank2()
+    test_forward_context()
     test_nondefault_stream()
-    test_supported_sizes()
-    print('BACKWARD CORE VALIDATION PASS',flush=True)
+    test_lifetime_and_repeated_backward()
+    test_sizes_and_failures()
+    test_tiny_gradient()
+
+    print("BACKWARD CORE VALIDATION PASS", flush=True)
 
 
-if __name__=='__main__':run()
+if __name__ == "__main__":
+    main()

@@ -64,11 +64,10 @@ public:
     SPLRBackwardContext& operator=(SPLRBackwardContext&& other) noexcept;
 
     // ---------------- Forward-side interface ----------------
-    // The functions below are called by cuda_sinkhorn_splr_bwd() only.
+    // The functions below are called by cuda_sinkhorn_splr_save_ctx() only.
 
-    // Copy a CSR triple for immediate-convergence fallback.
-    // The normal path adopts the forward state
-    // instead of snapshotting it.
+    // Copy the final CSR for immediate-convergence fallback.
+    // The normal path instead adopts the forward solver and its backing buffers.
     void snapshot_sphess(
         const double* d_values, const int* d_colind, const int* d_rowptr,
         size_t nnz
@@ -104,13 +103,13 @@ public:
     // ---------------- Backward-side interface ----------------
 
     // Compute z = B^{-1} r. d_r and d_z are device pointers of length
-    // problem_size. Waits for caller_stream and returns after copy-back
-    // completes, so caller tensors and context scratch remain safe to reuse.
+    // problem_size. The cuDSS stream waits for caller_stream, then completes
+    // the solve and copy-back before returning; scratch is safe to reuse.
     void apply_preconditioner(
         const double* d_r, double* d_z, cudaStream_t caller_stream
     );
 
-    // -------- Native diagonal preconditioner () ----------------
+    // ---------------- Native diagonal preconditioner ----------------
     // M_D^{-1} r = D_A^{-1} r, where D_A = diag(A) of the SAME stored-scale
     // sparsified matrix A whose factorization this context owns. The
     // exact-Q (unshifted) diagonal is intentionally NOT used here.
@@ -214,7 +213,7 @@ private:
     double* d_invA_y = nullptr;
 
 
-    // Diagonal preconditioner (): D_A^{-1} of the owned CSR.
+    // Diagonal preconditioner: D_A^{-1} of the owned CSR.
     // Always context-owned (allocated in the constructor, freed by
     // release_buffers, stolen by the move operations); never adopted, never
     // an alias of d_rhs/d_sol. Filled once by

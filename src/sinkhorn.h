@@ -32,7 +32,7 @@ void cuda_sinkhorn_splr(
 // converged:      if non-null, set to true iff the loop exits with
 //                 ||grad|| < tol
 class SPLRBackwardContext;
-void cuda_sinkhorn_splr_bwd(
+void cuda_sinkhorn_splr_save_ctx(
     const double* M, const double* a, const double* b, double* P,
     double reg, int max_iter, double tol, int n, int m, int* niter,
     double density_max, double shift_max,

@@ -12,8 +12,68 @@
 
 #include "solvers.h"
 #include "backward_context.h"
+#include "backward_solver.h"
+#include <cmath>
 
 namespace py = pybind11;
+
+// Validate Torch inputs and return native lambda / iteration / convergence data.
+// All iterative algebra stays in the raw-pointer solver on the current stream.
+py::dict torch_solve_backward_native(
+    torch::Tensor T, torch::Tensor rhs, SPLRBackwardContext& context,
+    const std::string& mode, double tol, int max_iter
+)
+{
+    // Validate tensor shape, dtype, device and reduced-system dimensions.
+    if (!T.is_cuda() || !rhs.is_cuda() || T.scalar_type() != torch::kFloat64 ||
+        rhs.scalar_type() != torch::kFloat64 || T.dim() != 2 || rhs.dim() != 1)
+        throw py::value_error("T/rhs must be CUDA float64 tensors of rank 2/1");
+    const int64_t n = T.size(0), m = T.size(1);
+    validate_backward_dimensions(n, m);
+    if (T.device() != rhs.device() || rhs.numel() != n + m - 1)
+        throw py::value_error("rhs must share T's device and have length n+m-1");
+    if (!context.is_valid() || context.problem_size() != n + m - 1)
+        throw py::value_error("Invalid or dimension-mismatched backward context");
+
+    // Validate PCG options and select the native preconditioner.
+    if (!std::isfinite(tol) || tol <= 0 || max_iter <= 0)
+        throw py::value_error("tol must be finite and positive; max_iter must be positive");
+    BackwardPreconditioner selected;
+    if (mode == "none") selected = BackwardPreconditioner::None;
+    else if (mode == "diag") selected = BackwardPreconditioner::Diag;
+    else if (mode == "splr") selected = BackwardPreconditioner::Splr;
+    else throw py::value_error("preconditioner must be none, diag or splr");
+
+    // Guard T's device and verify that the retained context belongs to it.
+    const at::cuda::CUDAGuard guard(T.device());
+    cudaPointerAttributes attributes;
+    const auto status = cudaPointerGetAttributes(&attributes, context.csr_values());
+    if (status != cudaSuccess)
+        throw std::runtime_error(cudaGetErrorString(status));
+    if (attributes.device != T.get_device())
+        throw py::value_error("Backward context must be on T's device");
+
+    // Capture the current PyTorch CUDA stream before tensor preparation.
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Keep contiguous inputs and output alive through the native solve.
+    T = T.contiguous();
+    rhs = rhs.contiguous();
+    auto lambda = torch::empty_like(rhs);
+
+    // Dispatch one native backward solve.
+    const PCGResult result = solve_backward_native(
+        T.data_ptr<double>(), rhs.data_ptr<double>(), lambda.data_ptr<double>(),
+        static_cast<int>(n), static_cast<int>(m), context, selected, tol, max_iter, stream
+    );
+
+    // Expose the solution and convergence metadata to Python.
+    py::dict out;
+    out["lambda"] = lambda;
+    out["iterations"] = result.iterations;
+    out["converged"] = result.converged;
+    return out;
+}
 
 // PyTorch interface for sinkhorn_bcd function
 py::dict torch_sinkhorn_bcd(
@@ -434,7 +494,7 @@ void register_backward_context(py::module_& m)
         .def("_secant_y", &ctx_secant_y);
 }
 
-py::dict torch_sinkhorn_splr_bwd(
+py::dict torch_sinkhorn_splr_save_ctx(
     torch::Tensor M,
     torch::Tensor a,
     torch::Tensor b,
@@ -455,15 +515,10 @@ py::dict torch_sinkhorn_splr_bwd(
         throw std::runtime_error("a and b must be 1D tensors");
     }
 
-    int n = M.size(0);
-    int m = M.size(1);
-
-    // Top-K sparsifies n * (m - 1) entries; an empty domain is unsupported.
-    // Validate here before allocations/kernels, including direct native calls.
-    if (n < 1 || m < 2)
-    {
-        throw py::value_error("SPLR requires M.shape = (n, m) with n >= 1 and m >= 2");
-    }
+    // Check int64 shapes before narrowing or allocating an unsupported context.
+    validate_backward_dimensions(M.size(0), M.size(1));
+    const int n = static_cast<int>(M.size(0));
+    const int m = static_cast<int>(M.size(1));
 
     if (a.size(0) != n || b.size(0) != m)
     {
@@ -565,7 +620,7 @@ py::dict torch_sinkhorn_splr_bwd(
     // Call CUDA function for the backward-capable SPLR algorithm
     int niter = 0;
     bool converged = false;
-    cuda_sinkhorn_splr_bwd(
+    cuda_sinkhorn_splr_save_ctx(
         d_M_ptr, d_a_ptr, d_b_ptr, d_P_ptr,
         reg, max_iter, tol, n, m, &niter,
         density_max, shift_max,
@@ -578,7 +633,7 @@ py::dict torch_sinkhorn_splr_bwd(
     if (!ctx.is_valid())
     {
         throw std::runtime_error(
-            "torch_sinkhorn_splr_bwd: forward pass failed (non-finite "
+            "torch_sinkhorn_splr_save_ctx: forward pass failed (non-finite "
             "objective value); no backward context available"
         );
     }
@@ -607,7 +662,7 @@ py::dict torch_sinkhorn_splr_bwd(
 
     if (verbose > 0)
     {
-        std::cout << "torch_sinkhorn_splr_bwd (CUDA implementation) completed" << std::endl;
+        std::cout << "torch_sinkhorn_splr_save_ctx (CUDA implementation) completed" << std::endl;
         std::cout << "Input shape: [" << n << " x " << m << "]" << std::endl;
         std::cout << "Regularization parameter: " << reg << std::endl;
         std::cout << "Tolerance: " << tol << std::endl;

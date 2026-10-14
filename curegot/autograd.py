@@ -25,11 +25,11 @@ AMP / autocast is unsupported and raises. Double backward is unsupported
 Non-convergence policy (production-safe): forward non-convergence and
 backward PCG non-convergence both raise RuntimeError rather than returning
 silently bad values. The lower-level manual API
-(curegot.torch.sinkhorn_splr_bwd + curegot.torch.solve_backward) keeps its
+(curegot.torch.sinkhorn_splr_save_ctx + curegot.torch.solve_backward) keeps its
 flag-returning semantics for research use.
 
 This module changes NO solver math: forward is the native
-sinkhorn_splr_bwd, backward is curegot.backward.solve_backward. The
+sinkhorn_splr_save_ctx, backward is curegot.backward.solve_backward. The
 default backward preconditioner is the native diagonal preconditioner.
 """
 
@@ -43,7 +43,6 @@ from .backward import solve_backward, _VALID_PRECONDITIONERS
 
 __all__ = [
     "splr_ot",
-    "SPLROT",
     "SPLROTFunction",
 ]
 
@@ -143,7 +142,7 @@ class SPLROTFunction(torch.autograd.Function):
 
     forward runs the native SPLR solver and stashes the plan and the
     pybind backward context on the autograd ctx; backward runs the shared
-    solve_backward (curegot._backward_core PCG) with the chosen
+    solve_backward (native C++ PCG) with the chosen
     preconditioner.
     """
 
@@ -156,7 +155,9 @@ class SPLROTFunction(torch.autograd.Function):
         }
         if density is not None:
             kwargs["density"] = density
-        out = _native_torch.sinkhorn_splr_bwd(
+
+        # Run forward and retain its final plan and preconditioner context.
+        out = _native_torch.sinkhorn_splr_save_ctx(
             M, a, b, eta, tol, max_iter, 0, **kwargs
         )
         if not bool(out["converged"]):
@@ -169,27 +170,26 @@ class SPLROTFunction(torch.autograd.Function):
             )
         T = out["plan"]
 
-        # save_for_backward is tensor-only; the pybind context is attached
-        # as a plain attribute. Python refcounting keeps it alive until the
-        # autograd graph (and hence this ctx) is freed -- verified by the
-        # "forward locals released before backward" validation test.
+        # The graph owns the saved tensor and the separate pybind context.
         ctx.save_for_backward(T)
         ctx.backward_context = out["context"]
         ctx.eta = eta
         ctx.backward_preconditioner = backward_preconditioner
         ctx.backward_tol = backward_tol
         ctx.backward_max_iter = backward_max_iter
+
         return T
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_output):
         (T,) = ctx.saved_tensors
-        # Downstream gradients are not guaranteed contiguous; the shared
-        # backward math does not require contiguity, but normalize cheaply
-        # (no-op when already contiguous) to keep the contract simple.
+
+        # Make strided upstream gradients contiguous at the boundary.
         G = grad_output if grad_output.is_contiguous() \
             else grad_output.contiguous()
+
+        # Build the RHS, dispatch native PCG and assemble the cost gradient.
         res = solve_backward(
             T, G, ctx.backward_context, ctx.eta,
             preconditioner=ctx.backward_preconditioner,
@@ -207,6 +207,7 @@ class SPLROTFunction(torch.autograd.Function):
                 f"preconditioner='{ctx.backward_preconditioner}')"
             )
         grad_M = res["grad"]
+
         # One gradient per forward input (M, a, b, eta, tol, max_iter,
         # density, candidate_sinkhorn_iter, backward_preconditioner,
         # backward_tol, backward_max_iter) -- order must match exactly.
@@ -229,7 +230,7 @@ def splr_ot(
     density=None,
     candidate_sinkhorn_iter=3,
     backward_preconditioner="diag",
-    backward_tol=1e-12,
+    backward_tol=1e-6,
     backward_max_iter=2000,
 ):
     """Differentiable entropic-OT plan via the SPLR solver.
@@ -241,14 +242,14 @@ def splr_ot(
         b:   [m] CUDA float64 target marginal (constant).
         eta: entropic regularization (constant scalar, required, > 0).
         tol: forward solver tolerance. Default 1e-6 matches the native
-             pybind default of sinkhorn_splr_bwd.
+             pybind default of sinkhorn_splr_save_ctx.
         max_iter: forward iteration cap (native default 1000).
         density: sparsification budget in (0, 1]; None -> native default
              min(10 / min(n, m), 1.0).
         candidate_sinkhorn_iter: native default 3.
         backward_preconditioner: "diag" (default, native diagonal) |
              "splr" (cuDSS + rank-2) | "none" (plain CG, debug).
-        backward_tol: backward PCG relative residual tolerance. Default: 1e-12.
+        backward_tol: backward PCG relative residual tolerance. Default: 1e-6.
         backward_max_iter: backward PCG cap (2000).
 
     Returns:
@@ -302,60 +303,3 @@ def splr_ot(
         int(candidate_sinkhorn_iter), backward_preconditioner,
         float(backward_tol), int(backward_max_iter),
     )
-
-
-class SPLROT(torch.nn.Module):
-    """nn.Module wrapper around splr_ot (config holder only).
-
-    Holds fixed hyperparameters; contains NO trainable parameters and no
-    buffers, so .train()/.eval()/.to(device) never change numerical
-    behavior and state_dict() is empty (re-instantiate from the repr/config
-    to "deserialize"). The backward context is created per forward call and
-    belongs to that autograd graph; nothing solver-related is stored on the
-    module.
-
-    Example:
-        >>> layer = curegot.torch.SPLROT(eta=0.05,
-        ...                            backward_preconditioner="diag")
-        >>> T = layer(M, a, b)
-    """
-
-    def __init__(self, eta, *, tol=1e-6, max_iter=1000, density=None,
-                 candidate_sinkhorn_iter=3, backward_preconditioner="diag",
-                 backward_tol=1e-12, backward_max_iter=2000):
-        super().__init__()
-        _check_eta_gradient(eta)
-        _validate_scalars(float(eta), float(tol), int(max_iter), density,
-                          int(candidate_sinkhorn_iter),
-                          float(backward_tol), int(backward_max_iter))
-        if backward_preconditioner not in _VALID_PRECONDITIONERS:
-            raise ValueError(
-                f"SPLROT: invalid backward_preconditioner "
-                f"'{backward_preconditioner}'; expected one of: "
-                f"{' | '.join(_VALID_PRECONDITIONERS)}"
-            )
-        self.eta = float(eta)
-        self.tol = float(tol)
-        self.max_iter = int(max_iter)
-        self.density = density
-        self.candidate_sinkhorn_iter = int(candidate_sinkhorn_iter)
-        self.backward_preconditioner = backward_preconditioner
-        self.backward_tol = float(backward_tol)
-        self.backward_max_iter = int(backward_max_iter)
-
-    def forward(self, M, a, b):
-        return splr_ot(
-            M, a, b,
-            eta=self.eta,
-            tol=self.tol,
-            max_iter=self.max_iter,
-            density=self.density,
-            candidate_sinkhorn_iter=self.candidate_sinkhorn_iter,
-            backward_preconditioner=self.backward_preconditioner,
-            backward_tol=self.backward_tol,
-            backward_max_iter=self.backward_max_iter,
-        )
-
-    def extra_repr(self):
-        return (f"eta={self.eta}, tol={self.tol}, density={self.density}, "
-                f"backward_preconditioner='{self.backward_preconditioner}'")

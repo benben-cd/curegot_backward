@@ -932,7 +932,7 @@ public:
         CUDA_CHECK(cudaMemcpy(d_gamma, d_gamma_bcd, m_Hsize * sizeof(double), cudaMemcpyDeviceToDevice));
     }
 
-    // --- Backward-context export (used by cuda_sinkhorn_splr_bwd) ---
+    // --- Backward-context export (used by cuda_sinkhorn_splr_save_ctx) ---
 
     // Snapshot the current sparsified Hessian CSR triple into the backward
     // context for immediate-convergence fallback; the normal path uses
@@ -1272,7 +1272,7 @@ void cuda_sinkhorn_splr(
 // factorization. Immediate-convergence fallback still uses snapshot +
 // context-refactorization because no forward factorization exists.
 //
-void cuda_sinkhorn_splr_bwd(
+void cuda_sinkhorn_splr_save_ctx(
     const double* M, const double* a, const double* b, double* P,
     double reg, int max_iter, double tol, int n, int m, int* niter,
     double density_max, double shift_max,

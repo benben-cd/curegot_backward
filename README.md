@@ -187,7 +187,7 @@ M.requires_grad_(True)
 T = curegot.torch.splr_ot(
     M, a, b, eta=0.05,
     backward_preconditioner="diag",
-    backward_tol=1e-12,
+    backward_tol=1e-6,
     backward_max_iter=2000,
 )
 loss = T.square().sum()
@@ -197,14 +197,13 @@ loss.backward()  # M.grad
 `backward_preconditioner` accepts `none` (plain CG), `diag` (default, inverse
 diagonal of the context sparse matrix A), or `splr` (reused forward sparse
 factorization plus its rank-2 correction when active). The diagonal is not
-the exact Q(T) diagonal. PCG always applies the matrix-free Q(T) operator.
+the exact Q(T) diagonal. Native C++ PCG always applies the matrix-free CUDA Q(T) operator.
 Performance depends on workload and requested accuracy; SPLR is not always
 faster than diagonal preconditioning.
 
 Only M gradients are supported. Marginals a/b must not require gradients;
 eta is a constant scalar. Forward or backward non-convergence raises.
-AMP and double backward are unsupported. `SPLROT` is an optional module
-wrapper for the same operation.
+AMP and double backward are unsupported.
 
 See [the example](examples/differentiable_splr_ot.py). After installation, run
 `python -B test/test_backward.py` for the dense oracle, all three autograd
